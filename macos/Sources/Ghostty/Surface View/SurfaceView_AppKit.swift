@@ -19,6 +19,17 @@ extension Ghostty {
             }
         }
 
+        /// How long a progress report stands before it is treated as stale.
+        /// How long a progress report stands without being repeated. Ghostty
+        /// drops one after 15 seconds, which is shorter than a quiet turn of a
+        /// program that reports once and then works.
+        /// `defaults write com.mitchellh.ghostty ProgressReportTimeout -float 120`
+        /// gives it longer.
+        static var progressReportTimeout: TimeInterval {
+            let seconds = UserDefaults.ghostty.double(forKey: "ProgressReportTimeout")
+            return seconds > 0 ? seconds : 15
+        }
+
         // The progress report (if any)
         override var progressReport: Action.ProgressReport? {
             didSet {
@@ -26,9 +37,15 @@ extension Ghostty {
                 progressReportTimer?.invalidate()
                 progressReportTimer = nil
 
-                // If we have a new progress report, start a timer to remove it after 15 seconds
+                // A report that is not repeated goes stale, so that a program that
+                // dies mid-progress does not leave the bar up forever. Upstream
+                // waits 15 seconds, which is shorter than the quiet stretches of
+                // a Claude Code turn: the bar, and the ring around the tab, would
+                // go out while the model was still working.
                 if progressReport != nil {
-                    progressReportTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
+                    progressReportTimer = Timer.scheduledTimer(
+                        withTimeInterval: Self.progressReportTimeout, repeats: false
+                    ) { [weak self] _ in
                         self?.progressReport = nil
                         self?.progressReportTimer = nil
                     }
