@@ -10,6 +10,7 @@ const gtk = @import("gtk");
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
 const ext = @import("../ext.zig");
+const global = @import("../../../global.zig");
 const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
@@ -273,7 +274,7 @@ pub const SplitTree = extern struct {
         );
 
         // Replace our tree
-        self.setTree(&new_tree);
+        self.setTreeAutoEqualized(&new_tree);
     }
 
     pub fn resize(
@@ -713,6 +714,43 @@ pub const SplitTree = extern struct {
         };
     }
 
+    /// Whether the splits of a window are kept equal whenever one opens or
+    /// closes.
+    ///
+    /// Ghostty halves the focused surface to make a new split, and gives the
+    /// space of a closed one to the sibling it shared a divider with, which
+    /// leaves the splits of a window uneven where iTerm2 keeps them equal.
+    /// `GHOSTTY_SPLIT_AUTO_EQUALIZE=1` in the environment asks for the even
+    /// ones.
+    ///
+    /// It is read from the environment rather than from the configuration so
+    /// that one config file serves this Ghostty and the one it was built from,
+    /// which would warn about a setting it does not know. The macOS half of
+    /// this build reads the same switch from the defaults of the application.
+    fn splitAutoEqualize() bool {
+        const value = global.environ().getPosix("GHOSTTY_SPLIT_AUTO_EQUALIZE") orelse return false;
+        if (value.len == 0) return false;
+        if (std.mem.eql(u8, value, "0")) return false;
+        if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+        return true;
+    }
+
+    /// Set the tree, with its splits made even first where that is asked for.
+    fn setTreeAutoEqualized(self: *Self, tree: *const Surface.Tree) void {
+        if (!splitAutoEqualize()) {
+            self.setTree(tree);
+            return;
+        }
+
+        var equalized = tree.equalize(Application.default().allocator()) catch |err| {
+            log.warn("unable to equalize tree: {}", .{err});
+            self.setTree(tree);
+            return;
+        };
+        defer equalized.deinit();
+        self.setTree(&equalized);
+    }
+
     pub fn actionEqualize(
         _: *gio.SimpleAction,
         parameter_: ?*glib.Variant,
@@ -827,7 +865,7 @@ pub const SplitTree = extern struct {
             return;
         };
         defer new_tree.deinit();
-        self.setTree(&new_tree);
+        self.setTreeAutoEqualized(&new_tree);
 
         // Grab focus. We have to set this on the "last focused" because our
         // focus will be set when the tree is redrawn.
