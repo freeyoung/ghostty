@@ -45,6 +45,21 @@ class BaseTerminalController: NSWindowController,
         didSet { syncFocusToSurfaceTree() }
     }
 
+    /// Whether the splits in a window are kept equal when one opens or closes.
+    ///
+    /// Ghostty halves the focused surface to make a new split and gives the
+    /// space of a closed split to the sibling it shared a divider with, which
+    /// leaves the splits of a window uneven where iTerm2 keeps them equal.
+    /// `defaults write com.mitchellh.ghostty SplitAutoEqualize -bool true` keeps
+    /// them equal, and without it this build splits as Ghostty does.
+    ///
+    /// It is read from the defaults of the application and not from the config
+    /// file, as everything this build adds is, so that the same config file
+    /// works with a Ghostty that knows none of it.
+    static var splitAutoEqualize: Bool {
+        UserDefaults.ghostty.bool(forKey: "SplitAutoEqualize")
+    }
+
     /// The tree of splits within this terminal window.
     @Published var surfaceTree: SplitTree<Ghostty.SurfaceView> = .init() {
         didSet {
@@ -307,7 +322,7 @@ class BaseTerminalController: NSWindowController,
         }
 
         replaceSurfaceTree(
-            newTree,
+            Self.splitAutoEqualize ? newTree.equalized() : newTree,
             moveFocusTo: newView,
             moveFocusFrom: oldView,
             undoAction: "New Split")
@@ -525,8 +540,9 @@ class BaseTerminalController: NSWindowController,
             nil
         }
 
+        let remaining = surfaceTree.removing(node)
         replaceSurfaceTree(
-            surfaceTree.removing(node),
+            Self.splitAutoEqualize ? remaining.equalized() : remaining,
             // When a non-focused surface is removed and this window stays as the key window,
             // we should refocus the `focusedSurface` to make sure the window's firstResponder remains as it is.
             //
