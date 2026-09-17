@@ -747,6 +747,7 @@ pub const Application = extern struct {
 
             .present_terminal => return Action.presentTerminal(target),
 
+            .color_change => return Action.colorChange(target, value),
             .progress_report => return Action.progressReport(target, value),
 
             .prompt_title => return Action.promptTitle(target, value),
@@ -803,7 +804,6 @@ pub const Application = extern struct {
             .cell_size,
             .render_inspector,
             .renderer_health,
-            .color_change,
             .reset_window_size,
             .check_for_updates,
             .undo,
@@ -2876,6 +2876,19 @@ const Action = struct {
             .app => false,
             .surface => |v| surface: {
                 v.rt_surface.surface.present();
+                break :surface true;
+            },
+        };
+    }
+
+    pub fn colorChange(
+        target: apprt.Target,
+        value: apprt.action.ColorChange,
+    ) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| surface: {
+                v.rt_surface.surface.setColorChange(value);
                 break :surface true;
             },
         };

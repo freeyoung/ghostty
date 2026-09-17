@@ -668,6 +668,12 @@ pub const Surface = extern struct {
         // Progress bar
         progress_bar_timer: ?c_uint = null,
 
+        // Keeps the pulse of an indeterminate progress bar moving. GTK's
+        // pulse() advances the block by one step rather than starting an
+        // animation, so without this a program that reports no number at all
+        // draws a block that never moves.
+        progress_pulse_timer: ?c_uint = null,
+
         // True while the bell is ringing. This will be set to false (after
         // true) under various scenarios, but can also manually be set to
         // false by a parent widget.
@@ -1048,6 +1054,41 @@ pub const Surface = extern struct {
         );
     }
 
+    /// The palette color a Claude Code hook writes the state of its session
+    /// into. Color 255 is the last of the grayscale slots, which nothing draws
+    /// with. The colors are the ones in ghostty/cc-status of the dotfiles.
+    const session_mark_palette = 255;
+    const session_marks = .{
+        .{ .{ 0x00, 0xff, 0x01 }, "working" },
+        .{ .{ 0x00, 0x00, 0xfe }, "waiting" },
+        .{ .{ 0x00, 0x80, 0x01 }, "idle" },
+    };
+
+    /// A color of the palette changed. The only one that means anything here is
+    /// the mark a hook leaves to say what the session in this surface is doing;
+    /// the rest is the program's business and the renderer's.
+    pub fn setColorChange(self: *Self, value: apprt.action.ColorChange) void {
+        if (@intFromEnum(value.kind) != session_mark_palette) return;
+
+        const state: [:0]const u8 = state: {
+            inline for (session_marks) |mark| {
+                if (value.r == mark[0][0] and
+                    value.g == mark[0][1] and
+                    value.b == mark[0][2]) break :state mark[1];
+            }
+
+            // Any other color is the palette going back to what the theme
+            // says, which is what the hook does when a session ends.
+            break :state "none";
+        };
+
+        _ = self.as(gtk.Widget).activateAction(
+            "tab.session-state",
+            glib.ext.VariantType.stringFor([:0]const u8),
+            @as([*:0]const u8, state),
+        );
+    }
+
     /// Set the current progress report state.
     pub fn setProgressReport(
         self: *Self,
@@ -1055,13 +1096,19 @@ pub const Surface = extern struct {
     ) void {
         const priv = self.private();
 
-        // No matter what, we stop the timer because if we're removing
-        // then we're done and otherwise we restart it.
+        // No matter what, we stop the timers because if we're removing
+        // then we're done and otherwise we restart them.
         if (priv.progress_bar_timer) |timer| {
             if (glib.Source.remove(timer) == 0) {
                 log.warn("unable to remove progress bar timer", .{});
             }
             priv.progress_bar_timer = null;
+        }
+        if (priv.progress_pulse_timer) |timer| {
+            if (glib.Source.remove(timer) == 0) {
+                log.warn("unable to remove progress pulse timer", .{});
+            }
+            priv.progress_pulse_timer = null;
         }
 
         if (priv.config) |config| {
@@ -1073,6 +1120,11 @@ pub const Surface = extern struct {
         }
 
         const progress_bar = priv.progress_bar_overlay;
+
+        // Set by every branch that pulses, so that the pulse can be kept
+        // moving below for as long as this state lasts.
+        var pulsing: bool = false;
+
         switch (value.state) {
             // Remove the progress bar
             .remove => {
@@ -1088,6 +1140,7 @@ pub const Surface = extern struct {
                     progress_bar.setFraction(computeFraction(progress));
                 } else {
                     progress_bar.pulse();
+                    pulsing = true;
                 }
             },
 
@@ -1099,6 +1152,7 @@ pub const Surface = extern struct {
                     progress_bar.setFraction(computeFraction(progress));
                 } else {
                     progress_bar.pulse();
+                    pulsing = true;
                 }
             },
 
@@ -1106,6 +1160,7 @@ pub const Surface = extern struct {
             // indicate that things are still happening.
             .indeterminate => {
                 progress_bar.pulse();
+                pulsing = true;
             },
 
             // If a progress value was provided, set the progress bar to that value.
@@ -1123,15 +1178,70 @@ pub const Surface = extern struct {
         assert(value.state != .remove);
         progress_bar.as(gtk.Widget).setVisible(@intFromBool(true));
 
+        // Keep an indeterminate bar moving. GTK's pulse() advances the block
+        // by 1 step and stops there, so a program that reports no number --
+        // which is most of them, once the work stops being countable -- would
+        // otherwise leave a block standing still, which reads as a program that
+        // has hung rather than one that is working.
+        if (pulsing) {
+            assert(priv.progress_pulse_timer == null);
+            priv.progress_pulse_timer = glib.timeoutAdd(
+                progress_pulse_interval_ms,
+                progressPulseTimer,
+                self,
+            );
+        }
+
         // Start our timer to remove bad actor programs that stall
         // the progress bar.
-        const progress_bar_timeout_seconds = 15;
-        assert(priv.progress_bar_timer == null);
-        priv.progress_bar_timer = glib.timeoutAdd(
-            progress_bar_timeout_seconds * std.time.ms_per_s,
-            progressBarTimer,
-            self,
-        );
+        const timeout_seconds = progressReportTimeout();
+        if (timeout_seconds > 0) {
+            assert(priv.progress_bar_timer == null);
+            priv.progress_bar_timer = glib.timeoutAdd(
+                timeout_seconds * std.time.ms_per_s,
+                progressBarTimer,
+                self,
+            );
+        }
+    }
+
+    /// The pace of the pulse. A bar's block moves by its pulse-step, a tenth of
+    /// the bar by default, so 10 of these carry it from 1 end to the other:
+    /// 150ms is the 1.5 seconds the light on the Mac takes to cross a tab.
+    const progress_pulse_interval_ms = 150;
+
+    /// 1 step of the pulse of an indeterminate progress bar.
+    fn progressPulseTimer(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud.?));
+        self.private().progress_bar_overlay.pulse();
+        return @intFromBool(glib.SOURCE_CONTINUE);
+    }
+
+    /// How long a progress report stands without an update before it is taken
+    /// for a program that has stalled and the bar is removed.
+    ///
+    /// Ghostty's own answer is 15 seconds with no setting for it, which is
+    /// short for a Claude Code session that thinks for longer than that between
+    /// reports: the bar vanishes in the middle of work that is still going.
+    /// `GHOSTTY_PROGRESS_REPORT_TIMEOUT` is that setting, in seconds, 0 meaning
+    /// a bar that stands until the program takes it down.
+    ///
+    /// It is read from the environment rather than from the configuration so
+    /// that one config file serves this Ghostty and the one it was built from,
+    /// which would warn about a setting it does not know. The macOS half of
+    /// this build reads the same number from the defaults of the application.
+    fn progressReportTimeout() u32 {
+        const default: u32 = 15;
+        const value = global.environ().getPosix("GHOSTTY_PROGRESS_REPORT_TIMEOUT") orelse
+            return default;
+        if (value.len == 0) return default;
+        return std.fmt.parseUnsigned(u32, value, 10) catch {
+            log.warn(
+                "GHOSTTY_PROGRESS_REPORT_TIMEOUT={s} is not a count of seconds, using {d}",
+                .{ value, default },
+            );
+            return default;
+        };
     }
 
     /// The progress bar hasn't been updated by the TUI recently, remove it.
@@ -1920,6 +2030,13 @@ pub const Surface = extern struct {
             priv.progress_bar_timer = null;
         }
 
+        if (priv.progress_pulse_timer) |timer| {
+            if (glib.Source.remove(timer) == 0) {
+                log.warn("unable to remove progress pulse timer", .{});
+            }
+            priv.progress_pulse_timer = null;
+        }
+
         if (priv.idle_rechild) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove idle source", .{});
@@ -2097,6 +2214,36 @@ pub const Surface = extern struct {
         return true;
     }
 
+    /// The glyph Claude Code puts in front of the title while the model works:
+    /// a circle filling and emptying. The tab already says that, and says it
+    /// better -- the dot beside the title is 1 of 3 colors, and the spinner
+    /// turns -- so the glyph is the same news twice, in the half of the title
+    /// a narrow tab has room for.
+    ///
+    /// Only this one. The ✳ of a session with nothing to do stays: it is the
+    /// only thing Claude puts there that is not said again elsewhere, and it
+    /// is what the title of a finished session looks like. Older Claude
+    /// versions spun a braille glyph instead; add its codepoints here if one
+    /// ever turns up.
+    const title_spinner_glyphs = [_]u21{ '◐', '◑', '◒', '◓' };
+
+    /// `title` without a leading spinner and the spaces that follow it, or
+    /// `title` unchanged when it does not start with one -- including when the
+    /// spinner is the whole of it, since an empty tab title says less than a
+    /// repeated one.
+    fn titleWithoutSpinner(title: [:0]const u8) [:0]const u8 {
+        var rest = title;
+        while (rest.len > 0) {
+            const n = std.unicode.utf8ByteSequenceLength(rest[0]) catch break;
+            if (n > rest.len) break;
+            const cp = std.unicode.utf8Decode(rest[0..n]) catch break;
+            if (std.mem.indexOfScalar(u21, &title_spinner_glyphs, cp) == null) break;
+            rest = rest[n..];
+            while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+        }
+        return if (rest.len > 0) rest else title;
+    }
+
     /// Set the title for this surface, copies the value. This should always
     /// be the title as set by the terminal program, not any manually set
     /// title. For manually set titles see `setTitleOverride`.
@@ -2104,8 +2251,29 @@ pub const Surface = extern struct {
         const priv = self.private();
         if (priv.title) |v| glib.free(@ptrCast(@constCast(v)));
         priv.title = null;
-        if (title) |v| priv.title = glib.ext.dupeZ(u8, v);
+        if (title) |v| priv.title = glib.ext.dupeZ(u8, titleWithoutSpinner(v));
         self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
+    }
+
+    test "titleWithoutSpinner" {
+        const testing = std.testing;
+        // The spinner and the space after it go.
+        try testing.expectEqualStrings("a task", titleWithoutSpinner("◐ a task"));
+        try testing.expectEqualStrings("a task", titleWithoutSpinner("◓  a task"));
+        // Every frame of it, and more than 1 of them.
+        for ([_][:0]const u8{ "◐ x", "◑ x", "◒ x", "◓ x" }) |t| {
+            try testing.expectEqualStrings("x", titleWithoutSpinner(t));
+        }
+        try testing.expectEqualStrings("x", titleWithoutSpinner("◐ ◑ x"));
+        // Everything else stays, the ✳ of an idle session above all.
+        try testing.expectEqualStrings("✳ a task", titleWithoutSpinner("✳ a task"));
+        try testing.expectEqualStrings("a task", titleWithoutSpinner("a task"));
+        try testing.expectEqualStrings(" a task", titleWithoutSpinner(" a task"));
+        try testing.expectEqualStrings("~/code ◐", titleWithoutSpinner("~/code ◐"));
+        try testing.expectEqualStrings("", titleWithoutSpinner(""));
+        // A title that is nothing but a spinner keeps it.
+        try testing.expectEqualStrings("◐", titleWithoutSpinner("◐"));
+        try testing.expectEqualStrings("◐ ", titleWithoutSpinner("◐ "));
     }
 
     /// Overridden title. This will be generally be shown over the title
