@@ -32,6 +32,10 @@ extension Ghostty {
         // The progress report (if any)
         @Published var progressReport: Action.ProgressReport?
 
+        // What a Claude Code hook says the session in this surface is doing. It
+        // writes the state into palette color 255, which nothing draws with.
+        @Published var sessionMark: TerminalActivity = .none
+
         // The currently active key tables. Empty if no tables are active.
         @Published var keyTables: [String] = []
 

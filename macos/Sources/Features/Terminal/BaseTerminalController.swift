@@ -45,21 +45,6 @@ class BaseTerminalController: NSWindowController,
         didSet { syncFocusToSurfaceTree() }
     }
 
-    /// Whether the splits in a window are kept equal when one opens or closes.
-    ///
-    /// Ghostty halves the focused surface to make a new split and gives the
-    /// space of a closed split to the sibling it shared a divider with, which
-    /// leaves the splits of a window uneven where iTerm2 keeps them equal.
-    /// `defaults write com.mitchellh.ghostty SplitAutoEqualize -bool true` keeps
-    /// them equal, and without it this build splits as Ghostty does.
-    ///
-    /// It is read from the defaults of the application and not from the config
-    /// file, as everything this build adds is, so that the same config file
-    /// works with a Ghostty that knows none of it.
-    static var splitAutoEqualize: Bool {
-        UserDefaults.ghostty.bool(forKey: "SplitAutoEqualize")
-    }
-
     /// The tree of splits within this terminal window.
     @Published var surfaceTree: SplitTree<Ghostty.SurfaceView> = .init() {
         didSet {
@@ -76,6 +61,26 @@ class BaseTerminalController: NSWindowController,
 
     /// True when any surface in this controller currently has an active bell.
     @Published private(set) var bell: Bool = false
+
+    /// What the surfaces in this controller report through OSC 9;4, as 1 value
+    /// for the whole window. The tab shows this, since a surface is only visible
+    /// while its tab is.
+    @Published private(set) var activity: TerminalActivity = .none
+
+    /// Whether the splits in a window are kept equal when one opens or closes.
+    ///
+    /// Ghostty halves the focused surface to make a new split and gives the
+    /// space of a closed split to the sibling it shared a divider with, which
+    /// leaves the splits of a window uneven where iTerm2 keeps them equal.
+    /// `defaults write com.mitchellh.ghostty SplitAutoEqualize -bool true` keeps
+    /// them equal, and without it this build splits as Ghostty does.
+    ///
+    /// It is read from the defaults of the application and not from the config
+    /// file, as everything this build adds is, so that the same config file
+    /// works with a Ghostty that knows none of it.
+    static var splitAutoEqualize: Bool {
+        UserDefaults.ghostty.bool(forKey: "SplitAutoEqualize")
+    }
 
     /// Whether the terminal surface should focus when the mouse is over it.
     var focusFollowsMouse: Bool {
@@ -111,6 +116,9 @@ class BaseTerminalController: NSWindowController,
 
     /// Cancellable for aggregating bell state across all surfaces in this controller.
     private var bellStateCancellable: AnyCancellable?
+
+    /// Cancellable for aggregating progress state across all surfaces in this controller.
+    private var busyStateCancellable: AnyCancellable?
 
     /// Cancellable for clipboard confirmation requests from surfaces in this controller.
     private var clipboardConfirmationCancellable: AnyCancellable?
@@ -170,6 +178,7 @@ class BaseTerminalController: NSWindowController,
 
         // Setup our bell state for the window
         setupBellNotificationPublisher()
+        setupBusyStatePublisher()
         setupClipboardConfirmationPublisher()
 
         // Setup our notifications for behaviors
@@ -1702,6 +1711,49 @@ extension BaseTerminalController {
     }
 }
 
+/// What a window shows about the work going on in its surfaces. The order is the
+/// order of interest: a window where something waits for the user says so, even
+/// if another surface in it is still working.
+enum TerminalActivity: Int, Comparable {
+    case none
+    /// A session is there but has nothing to do. Only a hook reports this.
+    case idle
+    case working
+    case paused
+    /// Something went wrong and is waiting to be looked at, which outranks the
+    /// rest: it is the one a window full of tabs should be found by.
+    case error
+
+    /// The palette color a Claude Code hook writes its state into. Color 255 is
+    /// the last of the grayscale slots, which nothing draws with.
+    static let markPaletteIndex: UInt8 = 255
+
+    /// The state a hook wrote into the palette. The colors are the ones in
+    /// macos/ghostty/cc-status of the dotfiles, and ring.glsl draws the ring
+    /// inside the pane from the same 2 working and waiting colors.
+    init(mark: (red: UInt8, green: UInt8, blue: UInt8)) {
+        switch mark {
+        case (0x00, 0xff, 0x01): self = .working
+        case (0x00, 0x00, 0xfe): self = .paused
+        case (0x00, 0x80, 0x01): self = .idle
+        default: self = .none
+        }
+    }
+
+    init(_ report: Ghostty.Action.ProgressReport?) {
+        switch report?.state {
+        case .set, .indeterminate: self = .working
+        // OSC 9;4 pause. Nothing reports this on its own; a hook that knows the
+        // program is waiting for the user sends it.
+        case .pause: self = .paused
+        case .error: self = .error
+        default: self = .none
+        }
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
 // MARK: Combine Methods
 
 extension BaseTerminalController {
@@ -1721,6 +1773,40 @@ extension BaseTerminalController {
                     userInfo: [Notification.Name.terminalWindowHasBellKey: hasBell]
                 )
             }
+    }
+
+    /// Follows the progress reports of every surface in this controller's tree, so
+    /// that the tab can show what a surface that is not visible is doing. A Claude
+    /// Code session reports work this way while the model works, and its hook can
+    /// report a pause while it waits for an answer.
+    private func setupBusyStatePublisher() {
+        // 2 channels carry the state of a surface. The progress report is what
+        // the program running in it says, and the palette mark is what a hook
+        // that knows the session says. The mark wins wherever there is one: it
+        // is the only one that can tell an idle session from no session, and a
+        // session that has stopped in front of the user may well have left
+        // something of its own running that still reports progress.
+        let progress = surfaceValuesPublisher(
+            valueKeyPath: \.progressReport,
+            publisherKeyPath: \.$progressReport)
+        let marks = surfaceValuesPublisher(
+            valueKeyPath: \.sessionMark,
+            publisherKeyPath: \.$sessionMark)
+        busyStateCancellable = Publishers.CombineLatest(progress, marks)
+        .map { reports, marks in
+            Set(marks.keys).union(reports.keys).reduce(TerminalActivity.none) { activity, id in
+                let mark = marks[id] ?? TerminalActivity.none
+                let reported = TerminalActivity(reports[id] ?? nil)
+                return max(activity, mark != .none ? mark : reported)
+            }
+        }
+        .removeDuplicates()
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] activity in
+            guard let self else { return }
+            self.activity = activity
+            (self.window as? TerminalWindow)?.activity = activity
+        }
     }
 
     /// Creates a publisher for values on all surfaces in this controller's tree.

@@ -9,6 +9,9 @@ extension Ghostty.Action {
     struct ColorChange {
         let kind: Kind
         let color: Color
+        /// The color as the program sent it, for a reader that compares it
+        /// against an exact value.
+        let components: (red: UInt8, green: UInt8, blue: UInt8)
 
         enum Kind {
             case foreground
@@ -30,6 +33,7 @@ extension Ghostty.Action {
             }
 
             self.color = Color(red: Double(c.r) / 255, green: Double(c.g) / 255, blue: Double(c.b) / 255)
+            self.components = (red: c.r, green: c.g, blue: c.b)
         }
     }
 

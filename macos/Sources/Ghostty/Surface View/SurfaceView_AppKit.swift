@@ -621,7 +621,38 @@ extension Ghostty {
             }
         }
 
+        /// The glyph Claude Code puts in front of the title while the model
+        /// works: a circle filling and emptying. The tab already says that, and
+        /// says it better -- the dot beside the name is 1 of 3 colors, and the
+        /// light runs around the tab -- so the glyph is the same news twice, in
+        /// the half of a narrow tab that has room for anything.
+        ///
+        /// Only this one. The star of a session with nothing to do stays: it is
+        /// the only thing Claude puts there that is not said again elsewhere,
+        /// and it is what the title of a finished session looks like at a
+        /// glance down a column of tabs. Older Claude versions spun a braille
+        /// glyph instead; add its characters here if one ever turns up.
+        static let titleSpinnerGlyphs: Set<Character> = ["\u{25D0}", "\u{25D1}", "\u{25D2}", "\u{25D3}"]
+
+        /// `title` without a leading spinner and the spaces that follow it, or
+        /// `title` unchanged when it does not start with one -- including when
+        /// the spinner is the whole of it, since an empty tab title says less
+        /// than a repeated one.
+        static func titleWithoutSpinner(_ title: String) -> String {
+            var rest = Substring(title)
+            while let first = rest.first, titleSpinnerGlyphs.contains(first) {
+                rest = rest.dropFirst().drop(while: { $0 == " " })
+            }
+            return rest.isEmpty ? title : String(rest)
+        }
+
         func setTitle(_ title: String) {
+            // The title as the terminal set it, less the spinner in front of it.
+            // Ghostty has no hook that lets a watcher rewrite a title, as kitty
+            // does, so this is where it goes. A title set by hand never reaches
+            // this setter, by its own contract.
+            let title = Self.titleWithoutSpinner(title)
+
             // This fixes an issue where very quick changes to the title could
             // cause an unpleasant flickering. We set a timer so that we can
             // coalesce rapid changes. The timer is short enough that it still
@@ -791,6 +822,12 @@ extension Ghostty {
             case .background:
                 DispatchQueue.main.async { [weak self] in
                     self?.backgroundColor = change.color
+                }
+
+            case .palette(let index) where index == TerminalActivity.markPaletteIndex:
+                let mark = TerminalActivity(mark: change.components)
+                DispatchQueue.main.async { [weak self] in
+                    self?.sessionMark = mark
                 }
 
             default:
