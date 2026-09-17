@@ -1376,15 +1376,7 @@ pub const Surface = extern struct {
             // This can trigger an input method so we need to notify the im context
             // where the cursor is so it can render the dropdowns in the correct
             // place.
-            if (priv.core_surface) |surface| {
-                const ime_point = surface.imePoint();
-                priv.im_context.as(gtk.IMContext).setCursorLocation(&.{
-                    .f_x = @intFromFloat(ime_point.x),
-                    .f_y = @intFromFloat(ime_point.y),
-                    .f_width = 1,
-                    .f_height = 1,
-                });
-            }
+            self.updateImeCursorLocation();
 
             // We note that we're in a keypress because we want some logic to
             // depend on this. For example, we don't want to send character events
@@ -3310,6 +3302,46 @@ pub const Surface = extern struct {
         return @intFromBool(glib.SOURCE_REMOVE);
     }
 
+    /// Tell the input method where the cursor is, so that it can put its
+    /// candidate window there.
+    ///
+    /// A key event is not the only time to say so. A Wayland input method
+    /// that has grabbed the keyboard (fcitx5 or ibus through
+    /// input-method-v2) takes the keys of a composition for itself, so
+    /// none of them is a key event here, and the location stayed where
+    /// the last key that did get through had left it -- the top left
+    /// corner of the window, if none ever had. So a change of the preedit
+    /// says it as well.
+    fn updateImeCursorLocation(self: *Self) void {
+        const priv = self.private();
+        const surface = priv.core_surface orelse return;
+        const ime_point = surface.imePoint();
+
+        // imePoint divides pixels by our content scale, which is the scale
+        // factor of the widget times the font DPI scale (getContentScale).
+        // GTK wants widget coordinates, and those are pixels divided by the
+        // scale factor alone. With a text scaling factor of 1.18 every
+        // coordinate came out at 85% of where it is, which puts the
+        // candidate window several rows above a cursor near the bottom of
+        // the window.
+        const font_scale: f64 = scale: {
+            const factor = priv.render_surface.as(gtk.Widget).getScaleFactor();
+            if (factor <= 0) break :scale 1;
+            break :scale self.getContentScale().y / @as(f64, @floatFromInt(factor));
+        };
+
+        // The rectangle is the cell of the cursor, not the point below it,
+        // so that a candidate window with no room below goes above the
+        // row instead of over it.
+        const height = @max(1, ime_point.height * font_scale);
+        priv.im_context.as(gtk.IMContext).setCursorLocation(&.{
+            .f_x = @intFromFloat(ime_point.x * font_scale),
+            .f_y = @intFromFloat(@max(0, ime_point.y * font_scale - height)),
+            .f_width = 1,
+            .f_height = @intFromFloat(height),
+        });
+    }
+
     fn imPreeditStart(
         _: *gtk.IMMulticontext,
         self: *Self,
@@ -3360,6 +3392,8 @@ pub const Surface = extern struct {
                 .{err},
             );
         };
+
+        self.updateImeCursorLocation();
     }
 
     fn imPreeditEnd(
