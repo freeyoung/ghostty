@@ -310,7 +310,15 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         };
         if (vsn.tag) |tag| {
             // Tip releases behave just like any other pre-release so we skip.
-            if (!std.mem.eql(u8, tag, "tip")) {
+            //
+            // So do the local-<date>-<commit> tags that
+            // dist/macos/release-local.sh leaves on a commit it has published
+            // a build of. They mark a build, not a release, and without this
+            // the build that made them cannot be run a second time: the tag is
+            // on HEAD by then, and a tag that is not vX.Y.Z panics below.
+            if (!std.mem.eql(u8, tag, "tip") and
+                !std.mem.startsWith(u8, tag, "local-"))
+            {
                 const expected = b.fmt("v{d}.{d}.{d}", .{
                     app_version.major,
                     app_version.minor,
