@@ -722,6 +722,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_PROGRESS_REPORT:
                 progressReport(app, target: target, v: action.action.progress_report)
 
+            case GHOSTTY_ACTION_PROGRAM_STATUS:
+                programStatus(app, target: target, v: action.action.program_status)
+
             case GHOSTTY_ACTION_CONFIG_CHANGE:
                 configChange(app, target: target, v: action.action.config_change)
 
@@ -2219,6 +2222,33 @@ extension Ghostty {
                     object: surfaceView,
                     userInfo: [Notification.KeyTableKey: action]
                 )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        /// OSC 7501: what the program in a surface says it is doing.
+        ///
+        /// Unlike a progress report this is not drawn in the window chrome, so
+        /// it reads no config: a tab shows a dot and the user asked for the
+        /// dot by running a program that reports.
+        private static func programStatus(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_program_status_e) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("program status does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                let activity = TerminalActivity(programStatus: v)
+                DispatchQueue.main.async {
+                    surfaceView.sessionMark = activity
+                }
 
             default:
                 assertionFailure()

@@ -19,6 +19,17 @@ extension Ghostty {
             }
         }
 
+        /// How long a progress report stands before it is treated as stale.
+        /// How long a progress report stands without being repeated. Ghostty
+        /// drops one after 15 seconds, which is shorter than a quiet turn of a
+        /// program that reports once and then works.
+        /// `defaults write com.mitchellh.ghostty ProgressReportTimeout -float 120`
+        /// gives it longer.
+        static var progressReportTimeout: TimeInterval {
+            let seconds = UserDefaults.ghostty.double(forKey: "ProgressReportTimeout")
+            return seconds > 0 ? seconds : 15
+        }
+
         // The progress report (if any)
         override var progressReport: Action.ProgressReport? {
             didSet {
@@ -26,9 +37,15 @@ extension Ghostty {
                 progressReportTimer?.invalidate()
                 progressReportTimer = nil
 
-                // If we have a new progress report, start a timer to remove it after 15 seconds
+                // A report that is not repeated goes stale, so that a program that
+                // dies mid-progress does not leave the bar up forever. Upstream
+                // waits 15 seconds, which is shorter than the quiet stretches of
+                // a Claude Code turn: the bar, and the ring around the tab, would
+                // go out while the model was still working.
                 if progressReport != nil {
-                    progressReportTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
+                    progressReportTimer = Timer.scheduledTimer(
+                        withTimeInterval: Self.progressReportTimeout, repeats: false
+                    ) { [weak self] _ in
                         self?.progressReport = nil
                         self?.progressReportTimer = nil
                     }
@@ -621,7 +638,38 @@ extension Ghostty {
             }
         }
 
+        /// The glyph Claude Code puts in front of the title while the model
+        /// works: a circle filling and emptying. The tab already says that, and
+        /// says it better -- the dot beside the name is 1 of 3 colors, and the
+        /// light runs around the tab -- so the glyph is the same news twice, in
+        /// the half of a narrow tab that has room for anything.
+        ///
+        /// Only this one. The star of a session with nothing to do stays: it is
+        /// the only thing Claude puts there that is not said again elsewhere,
+        /// and it is what the title of a finished session looks like at a
+        /// glance down a column of tabs. Older Claude versions spun a braille
+        /// glyph instead; add its characters here if one ever turns up.
+        static let titleSpinnerGlyphs: Set<Character> = ["\u{25D0}", "\u{25D1}", "\u{25D2}", "\u{25D3}"]
+
+        /// `title` without a leading spinner and the spaces that follow it, or
+        /// `title` unchanged when it does not start with one -- including when
+        /// the spinner is the whole of it, since an empty tab title says less
+        /// than a repeated one.
+        static func titleWithoutSpinner(_ title: String) -> String {
+            var rest = Substring(title)
+            while let first = rest.first, titleSpinnerGlyphs.contains(first) {
+                rest = rest.dropFirst().drop(while: { $0 == " " })
+            }
+            return rest.isEmpty ? title : String(rest)
+        }
+
         func setTitle(_ title: String) {
+            // The title as the terminal set it, less the spinner in front of it.
+            // Ghostty has no hook that lets a watcher rewrite a title, as kitty
+            // does, so this is where it goes. A title set by hand never reaches
+            // this setter, by its own contract.
+            let title = Self.titleWithoutSpinner(title)
+
             // This fixes an issue where very quick changes to the title could
             // cause an unpleasant flickering. We set a timer so that we can
             // coalesce rapid changes. The timer is short enough that it still

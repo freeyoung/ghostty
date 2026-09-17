@@ -32,6 +32,14 @@ class TerminalWindow: NSWindow {
         return view
     }()
 
+    /// The ring of light drawn around the tabs of the tab bar this window shows.
+    /// A pane is only visible while its tab is, so without this a session working
+    /// in another tab shows nothing at all.
+    private lazy var tabActivityRing = TabActivityRingView(frame: .zero)
+
+    /// Observers that keep the rings on their tabs.
+    private var tabActivityObservers: [NSObjectProtocol] = []
+
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private(set) var derivedConfig: DerivedConfig = .init()
 
@@ -69,6 +77,18 @@ class TerminalWindow: NSWindow {
         }
     }
 
+    /// What the surfaces in this window are doing, as reported through OSC 9;4.
+    /// Set by the controller, which watches every surface in the window.
+    var activity: TerminalActivity = .none {
+        didSet {
+            guard activity != oldValue else { return }
+            tab.attributedTitle = attributedTitle
+            // The tab bar belongs to whichever window is main, which is rarely
+            // the one whose state changed.
+            Self.refreshActivityRings()
+        }
+    }
+
     // MARK: NSWindow Overrides
 
     override var toolbar: NSToolbar? {
@@ -93,6 +113,15 @@ class TerminalWindow: NSWindow {
         ) { [weak self] n in
             guard let self, let menu = n.object as? NSMenu else { return }
             self.configureTabContextMenuIfNeeded(menu)
+        }
+
+        // The tabs move under the rings whenever the window resizes or the tab
+        // bar moves to another window, and relabelTabs covers a tab opening,
+        // closing or being dragged.
+        for name in [NSWindow.didResizeNotification, NSWindow.didBecomeMainNotification] {
+            tabActivityObservers.append(NotificationCenter.default.addObserver(
+                forName: name, object: self, queue: .main
+            ) { _ in Self.refreshActivityRings() })
         }
 
         // This is required so that window restoration properly creates our tabs
@@ -220,6 +249,11 @@ class TerminalWindow: NSWindow {
             tabBarDidDisappear()
         }
         viewModel.isMainWindow = true
+
+        // Another tab is open now, and which tabs carry a light goes with it,
+        // as does which tab is named in full.
+        Self.refreshActivityRings()
+        Self.refreshTabTitles()
     }
 
     override func resignMain() {
@@ -327,7 +361,8 @@ class TerminalWindow: NSWindow {
     var keyEquivalent: String? {
         didSet {
             // When our key equivalent is set, we must update the tab label.
-            guard let keyEquivalent else {
+            tab.attributedTitle = attributedTitle
+            guard let keyEquivalent, !Self.dotInTitle else {
                 keyEquivalentLabel.attributedStringValue = NSAttributedString()
                 return
             }
@@ -424,14 +459,125 @@ class TerminalWindow: NSWindow {
     private var titlebarTextFieldFrameCancellables = Set<AnyCancellable>()
 
     // Return a styled representation of our title property.
+    /// The title as the tab bar draws it.
+    ///
+    /// macOS 26 draws the tab that is open and the rest almost alike. With
+    /// `defaults write com.mitchellh.ghostty TabTitleContrast -bool true` the
+    /// open one is named in a heavier face and in full, and the rest keep the
+    /// fainter color macOS gives them. Without it this is what Ghostty does.
+    ///
+    /// The dot and the keyboard shortcut are part of the title, when they are
+    /// asked for, so that macOS centers the 3 of them together as iTerm2 does.
+    /// The accessory of a tab is laid out at its trailing edge instead, which
+    /// leaves the name in the middle and everything else against the far side.
+    ///
+    /// The title is 1 line, whatever is put in it: a tab bar drawn by AppKit
+    /// cuts a title with a newline in it down to the first word and an
+    /// ellipsis. iTerm2 draws its own tab bar, which is how it fits a second,
+    /// smaller line under the name.
     var attributedTitle: NSAttributedString? {
-        guard let titlebarFont = titlebarFont else { return nil }
+        let contrast = UserDefaults.ghostty.bool(forKey: "TabTitleContrast")
+        guard contrast || TerminalWindow.dotInTitle else {
+            guard let titlebarFont else { return nil }
+            return NSAttributedString(string: title, attributes: [
+                .font: titlebarFont,
+                .foregroundColor: isKeyWindow ? NSColor.labelColor : NSColor.secondaryLabelColor,
+            ])
+        }
 
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: titlebarFont,
-            .foregroundColor: isKeyWindow ? NSColor.labelColor : NSColor.secondaryLabelColor,
-        ]
-        return NSAttributedString(string: title, attributes: attributes)
+        let base = titlebarFont ?? NSFont.titleBarFont(ofSize: NSFont.systemFontSize)
+        let open = tabGroup?.selectedWindow === self
+        let font = contrast && open
+            ? NSFontManager.shared.convert(base, toHaveTrait: .boldFontMask)
+            : base
+        let color = contrast
+            ? (open ? NSColor.labelColor : Self.closedTabColor)
+            : (isKeyWindow ? NSColor.labelColor : NSColor.secondaryLabelColor)
+        let line = NSMutableAttributedString()
+        if TerminalWindow.dotInTitle, let dot = Self.dotColors[activity] {
+            // The dot leads the name, as it does on the tab of the GTK build,
+            // where it sits in the indicator of the page. A tab bar cuts a
+            // title it has no room for at the end, so a dot behind the name is
+            // the first thing a narrow tab drops and the state of a session is
+            // the last thing that should go.
+            //
+            // The tab bar paints the text of a title in a color of its own, and
+            // an image is the one thing in a string that it leaves alone.
+            let attachment = NSTextAttachment()
+            attachment.image = Self.dotImage(dot)
+            // An attachment sits on the baseline, and the middle of the text is
+            // half its cap height above that.
+            attachment.bounds = CGRect(
+                x: 0,
+                y: (base.capHeight - Self.dotSize) / 2,
+                width: Self.dotSize,
+                height: Self.dotSize)
+            // The run carries the font of the title, or an attachment at the
+            // head of a string lays the line out at the system font size.
+            let mark = NSMutableAttributedString(attachment: attachment)
+            mark.addAttribute(.font, value: base, range: NSRange(location: 0, length: mark.length))
+            mark.append(NSAttributedString(string: " ", attributes: [.font: base]))
+            line.append(mark)
+        }
+        line.append(NSAttributedString(string: title, attributes: [
+            .font: font,
+            .foregroundColor: color,
+        ]))
+        if TerminalWindow.dotInTitle, let keyEquivalent, !keyEquivalent.isEmpty {
+            line.append(NSAttributedString(string: "  " + keyEquivalent, attributes: [
+                .font: base,
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]))
+        }
+        return line
+    }
+
+    /// Whether the state of a session is told in the tab, as a colored dot
+    /// beside its name, which is where iTerm2 puts it.
+    static var dotInTitle: Bool {
+        UserDefaults.ghostty.bool(forKey: "TabSessionDot")
+    }
+
+    /// How strongly the tab that is not open is named, where 1 is as strongly as
+    /// the open one. macOS says `secondaryLabelColor`, which is a name at about
+    /// half strength, and a bar of those is hard to read at a glance -- the more
+    /// so under the glass macOS 26 lays over the tabs. The open tab is in a
+    /// heavier face, so it stands out by weight and does not need the rest held
+    /// down as far. `defaults write com.mitchellh.ghostty TabTitleContrastDim
+    /// 0.55` is what macOS would have done.
+    private static var closedTabColor: NSColor {
+        let dim = UserDefaults.ghostty.double(forKey: "TabTitleContrastDim")
+        return .labelColor.withAlphaComponent(dim > 0 ? min(dim, 1) : 0.72)
+    }
+
+    private static let dotSize: CGFloat = 8
+
+    /// The dot does not blink, as the one in kitty does: a title has to be
+    /// rebuilt to change it, which lays the whole tab bar out again, and the
+    /// outline of a tab that waits is already breathing.
+    private static func dotImage(_ color: NSColor) -> NSImage {
+        let image = NSImage(size: NSSize(width: dotSize, height: dotSize), flipped: false) { rect in
+            color.setFill()
+            NSBezierPath(ovalIn: rect.insetBy(dx: 0.75, dy: 0.75)).fill()
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+
+    /// The dots, in the colors of the kitty tab bar.
+    static let dotColors: [TerminalActivity: NSColor] = [
+        .idle: NSColor(srgbRed: 0x93 / 255, green: 0xDF / 255, blue: 0x99 / 255, alpha: 1),
+        .working: NSColor(srgbRed: 0xFF / 255, green: 0x9F / 255, blue: 0x0A / 255, alpha: 1),
+        .paused: NSColor(srgbRed: 0x57 / 255, green: 0x74 / 255, blue: 0xDB / 255, alpha: 1),
+        .error: NSColor(srgbRed: 0xFF / 255, green: 0x45 / 255, blue: 0x3A / 255, alpha: 1),
+    ]
+
+    /// Which tab is open changes the look of every tab, and nothing says so.
+    static func refreshTabTitles() {
+        for case let window as TerminalWindow in NSApp.windows {
+            window.tab.attributedTitle = window.attributedTitle
+        }
     }
 
     var titlebarContainer: NSView? {
@@ -630,6 +776,97 @@ class TerminalWindow: NSWindow {
     deinit {
         if let observer = tabMenuObserver {
             NotificationCenter.default.removeObserver(observer)
+        }
+        tabActivityObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    // MARK: Tab Activity Rings
+
+    /// Whether the tab that is open carries the light as well. Its own pane
+    /// draws the progress of what runs in it, so it does not, until
+    /// `defaults write com.mitchellh.ghostty TabActivityLightOnSelectedTab
+    /// -bool true` says otherwise.
+    static var lightsSelectedTab: Bool {
+        UserDefaults.ghostty.bool(forKey: "TabActivityLightOnSelectedTab")
+    }
+
+    /// Redraw the rings of every window, since only the one showing the tab bar
+    /// can draw them and any window's state can change.
+    static func refreshActivityRings() {
+        for case let window as TerminalWindow in NSApp.windows {
+            window.updateActivityRings()
+        }
+    }
+
+    /// Lay the overlay over this window's tab bar, with a ring around each tab
+    /// whose window is doing something.
+    ///
+    /// AppKit builds the tab bar again when a tab opens or closes and when the
+    /// bar moves to another window, and asks for none of that to be observed. A
+    /// refresh that arrives mid-rebuild finds a bar that does not line up with
+    /// the windows, so it leaves what is drawn alone and asks again in a moment
+    /// rather than tearing the rings down.
+    func updateActivityRings(retrying: Bool = false) {
+        guard let tabBarView else {
+            if retrying { tabActivityRing.removeFromSuperview() } else { retryActivityRings() }
+            return
+        }
+
+        guard let rings = activityRings() else {
+            if retrying { tabActivityRing.removeFromSuperview() } else { retryActivityRings() }
+            return
+        }
+
+        // AppKit hands the tab bar itself to whichever window shows it, and the
+        // overlay of the window it came from goes with it. That one belongs to a
+        // window that may be closing, and what it last drew would stay on the bar
+        // for good, so the bar carries this window's overlay and no other.
+        for overlay in tabBarView.subviews.compactMap({ $0 as? TabActivityRingView })
+        where overlay !== tabActivityRing {
+            overlay.removeFromSuperview()
+        }
+        if tabActivityRing.superview !== tabBarView {
+            tabActivityRing.removeFromSuperview()
+            tabBarView.addSubview(tabActivityRing)
+        }
+        tabActivityRing.frame = tabBarView.bounds
+        tabActivityRing.autoresizingMask = [.width, .height]
+        // Nothing is drawn for a window that has gone away, and nil only means
+        // that the tab bar is mid-rebuild.
+        tabActivityRing.ringsProvider = { [weak self] in
+            guard let self else { return [] }
+            return self.activityRings()
+        }
+        tabActivityRing.update(rings: rings)
+    }
+
+    /// A ring for every tab of this window's tab group that is doing something,
+    /// or nil when the tab buttons and the windows do not line up.
+    ///
+    /// The tab buttons are in visual order and so are the windows of a tab
+    /// group. If they ever disagree there is no way to tell which tab is which,
+    /// and a ring on the wrong tab is worse than a late one.
+    private func activityRings() -> [TabActivityRingView.Ring]? {
+        let buttons = tabButtonsInVisualOrder()
+        let windows = (tabGroup?.windows ?? []).compactMap { $0 as? TerminalWindow }
+        guard !buttons.isEmpty, buttons.count == windows.count else { return nil }
+        let selected = tabGroup?.selectedWindow
+        return zip(buttons, windows).map { button, window in
+            // An idle session has a dot in the tab and no light. The tab you are
+            // looking at shows what it is doing in the pane itself, so a light
+            // around that tab is the same news twice.
+            let open = window === selected
+            let lit = window.activity >= .working && (!open || Self.lightsSelectedTab)
+            return .init(
+                frame: tabActivityRing.convert(button.bounds, from: button),
+                activity: lit ? window.activity : .none,
+                selected: open)
+        }
+    }
+
+    private func retryActivityRings() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.updateActivityRings(retrying: true)
         }
     }
 

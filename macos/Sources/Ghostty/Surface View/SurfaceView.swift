@@ -29,6 +29,29 @@ extension Ghostty {
             surfaceFocus || lastFocusedSurface?.value === surfaceView
         }
 
+        /// What the bar across the top of the terminal shows.
+        ///
+        /// A progress report goes stale, because a program that reports one and
+        /// then works quietly has not said anything for a while. The mark a hook
+        /// leaves on the palette does not, and the tab of the window is lit from
+        /// it, so the bar follows the mark when the report has gone: a tab that
+        /// is lit and a pane that shows nothing is a window disagreeing with
+        /// itself.
+        private var surfaceProgress: Action.ProgressReport? {
+            if let report = surfaceView.progressReport, report.state != .remove {
+                return report
+            }
+            guard UserDefaults.ghostty.string(forKey: "SurfaceProgressBarStyle") == "match" else {
+                return nil
+            }
+            switch surfaceView.sessionMark {
+            case .working: return .init(state: .indeterminate, progress: nil)
+            case .paused: return .init(state: .pause, progress: nil)
+            case .error: return .init(state: .error, progress: nil)
+            default: return nil
+            }
+        }
+
         var body: some View {
             let center = NotificationCenter.default
 
@@ -73,7 +96,7 @@ extension Ghostty {
                 .ghosttySurfaceView(surfaceView)
 
                 // Progress report
-                if let progressReport = surfaceView.progressReport, progressReport.state != .remove {
+                if let progressReport = surfaceProgress {
                     VStack(spacing: 0) {
                         SurfaceProgressBar(report: progressReport)
                         Spacer()

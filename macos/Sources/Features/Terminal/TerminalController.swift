@@ -593,6 +593,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// changes, when a window is closed, and when tabs are reordered
     /// with the mouse.
     func relabelTabs() {
+        // A tab has opened, closed or been dragged, so the rings drawn around
+        // the tabs are over the wrong ones until they are laid out again, and
+        // which tab is the open one may have changed with it.
+        TerminalWindow.refreshActivityRings()
+        TerminalWindow.refreshTabTitles()
+
         // We only listen for frame changes if we have more than 1 window,
         // otherwise the accessory view doesn't matter.
         tabListenForFrame = window?.tabbedWindows?.count ?? 0 > 1
