@@ -754,6 +754,7 @@ pub const Application = extern struct {
 
             .present_terminal => return Action.presentTerminal(target),
 
+            .program_status => return Action.programStatus(target, value),
             .progress_report => return Action.progressReport(target, value),
 
             .prompt_title => return Action.promptTitle(target, value),
@@ -2759,6 +2760,19 @@ const Action = struct {
             .app => false,
             .surface => |v| surface: {
                 v.rt_surface.surface.present();
+                break :surface true;
+            },
+        };
+    }
+
+    pub fn programStatus(
+        target: apprt.Target,
+        value: apprt.action.ProgramStatus,
+    ) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| surface: {
+                v.rt_surface.surface.setProgramStatus(value);
                 break :surface true;
             },
         };

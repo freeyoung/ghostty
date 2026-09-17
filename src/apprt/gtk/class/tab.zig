@@ -1,5 +1,6 @@
 const std = @import("std");
 const adw = @import("adw");
+const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
@@ -169,6 +170,12 @@ pub const Tab = extern struct {
         /// The tooltip of this tab. This is usually bound to the active surface.
         tooltip: ?[:0]const u8 = null,
 
+        /// What the session in this tab is doing, and the blink of the dot
+        /// that says so while it waits.
+        session_state: SessionState = .none,
+        session_blink_timer: ?c_uint = null,
+        session_blink_on: bool = true,
+
         // Template bindings
         split_tree: *SplitTree,
 
@@ -236,6 +243,7 @@ pub const Tab = extern struct {
         const actions = [_]ext.actions.Action(Self){
             .init("close", actionClose, s_param_type),
             .init("ring-bell", actionRingBell, null),
+            .init("session-state", actionSessionState, s_param_type),
             .init("next-page", actionNextPage, null),
             .init("previous-page", actionPreviousPage, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
@@ -325,6 +333,13 @@ pub const Tab = extern struct {
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
+        }
+
+        if (priv.session_blink_timer) |timer| {
+            if (glib.Source.remove(timer) == 0) {
+                log.warn("unable to remove session blink timer", .{});
+            }
+            priv.session_blink_timer = null;
         }
 
         gtk.Widget.disposeTemplate(
@@ -451,6 +466,193 @@ pub const Tab = extern struct {
         const page = self.getTabPage() orelse return;
         if (page.getSelected() != 0) return;
         page.setNeedsAttention(@intFromBool(true));
+    }
+
+    /// What the program in one of this tab's surfaces says it is doing, from
+    /// the report it sent through OSC 7501.
+    ///
+    /// These are the protocol's states under the names this setup already drew:
+    /// `blocked` is waiting, and `failed` is the protocol's `error`.
+    const SessionState = enum {
+        none,
+        working,
+        waiting,
+        idle,
+        done,
+        failed,
+
+        /// The color the rest of this setup draws the state in: orange while
+        /// the model works, blue while it waits for an answer, green for a
+        /// session with nothing left to do. The same 3 as the kitty tab bar's
+        /// and the Mac's, which take them from claude/session_state.py.
+        ///
+        /// Cyan and red are new with OSC 7501, which says 2 things the palette
+        /// hack before it could not: a piece of work finished and not yet
+        /// looked at, and a program that failed.
+        fn color(self: SessionState) ?u24 {
+            return switch (self) {
+                .none => null,
+                .working => 0xff9500,
+                .waiting => 0x5f87ff,
+                .idle => 0x00d75f,
+                .done => 0x00d7d7,
+                .failed => 0xff5f5f,
+            };
+        }
+    };
+
+    /// A waiting dot is hollow for every second half second, which is the blink
+    /// the kitty tab bar gives it.
+    const session_blink_interval_ms = 500;
+
+    fn actionSessionState(
+        _: *gio.SimpleAction,
+        param_: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const param = param_ orelse {
+            log.warn("tab.session-state called without a parameter", .{});
+            return;
+        };
+
+        var str: ?[*:0]const u8 = null;
+        param.get("&s", &str);
+        const name = std.mem.sliceTo(str orelse return, 0);
+        self.setSessionState(std.meta.stringToEnum(SessionState, name) orelse .none);
+    }
+
+    /// Say what the session in this tab is doing.
+    ///
+    /// libadwaita has a word for 2 of the 3 states -- a page that is loading
+    /// spins, a page that needs attention is marked -- and this uses both. But
+    /// the mark is a line the width of the tab in the accent color, which says
+    /// "something happened here" and not which of 3 things, and it is gone the
+    /// moment the tab is selected. The Mac draws a colored dot instead, and the
+    /// kitty tab bar beside it draws the same dot in the same 3 colors, so a
+    /// glance across 2 terminals means 1 thing. That is worth more here than
+    /// speaking only in libadwaita's own vocabulary, so the dot is drawn too,
+    /// in the indicator a tab page already has room for.
+    fn setSessionState(self: *Self, state: SessionState) void {
+        const priv = self.private();
+        priv.session_state = state;
+
+        if (priv.session_blink_timer) |timer| {
+            if (glib.Source.remove(timer) == 0) {
+                log.warn("unable to remove session blink timer", .{});
+            }
+            priv.session_blink_timer = null;
+        }
+        priv.session_blink_on = true;
+
+        const page = self.getTabPage() orelse return;
+
+        // A page whose session is working spins, as a loading page does.
+        page.setLoading(@intFromBool(state == .working));
+
+        // A page that is waiting asks for attention, as a bell does, and only
+        // while it is not the page being looked at. So does one that failed:
+        // the Mac pulses the ring for both, and a window full of tabs should
+        // be found by either.
+        //
+        // done does not. Nothing is running, and it ranks below working, so
+        // the dot alone says it -- the same as the Mac, which draws no ring.
+        switch (state) {
+            .waiting, .failed => if (page.getSelected() == 0) {
+                page.setNeedsAttention(@intFromBool(true));
+            },
+            .working => {},
+            .none, .idle, .done => page.setNeedsAttention(@intFromBool(false)),
+        }
+
+        if (state == .waiting or state == .failed) {
+            priv.session_blink_timer = glib.timeoutAdd(
+                session_blink_interval_ms,
+                sessionBlinkTimer,
+                self,
+            );
+        }
+
+        self.drawSessionDot();
+    }
+
+    /// Half of the blink of a waiting dot.
+    fn sessionBlinkTimer(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud.?));
+        const priv = self.private();
+        priv.session_blink_on = !priv.session_blink_on;
+        self.drawSessionDot();
+        return @intFromBool(glib.SOURCE_CONTINUE);
+    }
+
+    /// Put the dot for the current state in this tab's indicator, or take it
+    /// away when there is no session to speak for.
+    fn drawSessionDot(self: *Self) void {
+        const priv = self.private();
+        const page = self.getTabPage() orelse return;
+
+        const rgb = priv.session_state.color() orelse {
+            page.setIndicatorIcon(null);
+            page.setIndicatorTooltip("");
+            return;
+        };
+
+        const texture = sessionDot(rgb, priv.session_blink_on);
+        defer texture.unref();
+        page.setIndicatorIcon(texture.as(gio.Icon));
+        page.setIndicatorTooltip(@tagName(priv.session_state));
+    }
+
+    /// The dot itself: a disc, or a ring while a waiting dot is blinked off.
+    ///
+    /// It is drawn rather than named because a tab page takes an icon, and an
+    /// icon from the theme is drawn in the theme's color -- which is the 1
+    /// thing this dot must not be, the color being the whole of what it says.
+    fn sessionDot(rgb: u24, filled: bool) *gdk.MemoryTexture {
+        const size = 32;
+        const stride = size * 4;
+
+        // The disc, and the ring left when a blink hollows it out. Inset from
+        // the edge so that neither is clipped by whatever box the tab bar gives
+        // an indicator.
+        const center: f32 = @as(f32, size) / 2;
+        const outer: f32 = center - 4;
+        const inner: f32 = outer - 5;
+
+        const r: f32 = @floatFromInt(@as(u8, @truncate(rgb >> 16)));
+        const g: f32 = @floatFromInt(@as(u8, @truncate(rgb >> 8)));
+        const b: f32 = @floatFromInt(@as(u8, @truncate(rgb)));
+
+        var pixels: [size * stride]u8 = undefined;
+        for (0..size) |y| {
+            for (0..size) |x| {
+                const dx = @as(f32, @floatFromInt(x)) + 0.5 - center;
+                const dy = @as(f32, @floatFromInt(y)) + 0.5 - center;
+                const d = @sqrt(dx * dx + dy * dy);
+
+                // How much of this pixel the shape covers, taken across the 1
+                // pixel an edge falls in, which is the whole of the smoothing
+                // a dot this size needs.
+                var a = std.math.clamp(outer + 0.5 - d, 0, 1);
+                if (!filled) a *= std.math.clamp(d - (inner - 0.5), 0, 1);
+
+                // Premultiplied, which is what the format below reads.
+                const i = y * stride + x * 4;
+                pixels[i + 0] = @intFromFloat(@round(r * a));
+                pixels[i + 1] = @intFromFloat(@round(g * a));
+                pixels[i + 2] = @intFromFloat(@round(b * a));
+                pixels[i + 3] = @intFromFloat(@round(255 * a));
+            }
+        }
+
+        const bytes = glib.Bytes.new(&pixels, pixels.len);
+        defer bytes.unref();
+        return gdk.MemoryTexture.new(
+            size,
+            size,
+            .r8g8b8a8_premultiplied,
+            bytes,
+            stride,
+        );
     }
 
     /// Select the next tab page.
