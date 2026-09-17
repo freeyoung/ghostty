@@ -45,6 +45,63 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+/// Whether this build was asked to keep the GPU resources of a surface that
+/// is hidden, so that a tab switched back to draws what it was holding at
+/// once rather than the window behind it.
+///
+/// A surface that is occluded gives up its swap chain, which is nearly all of
+/// the GPU memory it holds, and `drawFrame` builds a new one the next time it
+/// is asked to draw. On macOS every tab of a window is a window of its own, so
+/// every tab that is not the open one is occluded, and what its layer was
+/// showing went with the swap chain: the window is put on the screen before
+/// the rebuilt frame lands, and until it does the pane is seen through.
+///
+/// Unasked, this build does what the one it came from does and frees them.
+///
+/// Each desktop keeps a switch of this kind in its own place, and this reads
+/// that place rather than the configuration file: a Ghostty from the website
+/// would warn about a setting it has never heard of, and one configuration
+/// file has to serve both.
+///
+///   macOS: defaults write com.mitchellh.ghostty KeepGpuWhenHidden -bool true
+///   Linux: GHOSTTY_KEEP_GPU_WHEN_HIDDEN=1 in the environment
+fn keepGpuWhenHidden() bool {
+    if (comptime builtin.os.tag.isDarwin()) {
+        const key = macos.foundation.String.createWithBytes(
+            "KeepGpuWhenHidden",
+            .utf8,
+            false,
+        ) catch return false;
+        defer key.release();
+
+        // Named rather than asked for as the current application, so that the
+        // domain is the one the command above writes whatever is reading it:
+        // the application, or the `ghostty` beside it in the bundle.
+        const domain = macos.foundation.String.createWithBytes(
+            "com.mitchellh.ghostty",
+            .utf8,
+            false,
+        ) catch return false;
+        defer domain.release();
+
+        var valid: u8 = 0;
+        const value = macos.c.CFPreferencesGetAppBooleanValue(
+            @ptrCast(key),
+            @ptrCast(domain),
+            &valid,
+        );
+        return valid != 0 and value != 0;
+    }
+
+    const value = global.environ().getPosix(
+        "GHOSTTY_KEEP_GPU_WHEN_HIDDEN",
+    ) orelse return false;
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    return true;
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -1157,8 +1214,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.visible = visible;
             self.syncDisplayLink(null, null);
 
-            // When we're hidden, release our GPU resources.
-            if (!visible) {
+            // When we're hidden, release our GPU resources, unless this
+            // build was asked to hold on to them so that the tab this
+            // surface is in draws the moment it is looked at again.
+            if (!visible and !keepGpuWhenHidden()) {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
                 self.releaseGpuResources();
