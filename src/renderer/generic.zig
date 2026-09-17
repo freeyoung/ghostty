@@ -1188,8 +1188,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.visible = visible;
             self.syncDisplayLink(null, null);
 
-            // When we're hidden, release our GPU resources.
-            if (!visible) {
+            // When we're hidden, release our GPU resources, unless this
+            // build was asked to hold on to them so that the tab this
+            // surface is in draws the moment it is looked at again.
+            if (!visible and !fork_switch.keep_gpu_when_hidden.enabled()) {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
                 self.releaseGpuResources();

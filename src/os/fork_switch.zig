@@ -26,6 +26,16 @@ pub const link_join_hard_wraps: Switch = .{
     .env = "GHOSTTY_LINK_JOIN_HARD_WRAPS",
 };
 
+/// Keep the GPU resources of a surface that is hidden, so that a tab switched
+/// back to draws what it was holding at once rather than the window behind
+/// it. A surface that is occluded gives up its swap chain, which is nearly
+/// all of the GPU memory it holds, and on macOS every tab that is not the
+/// open one is occluded. Read each time a surface is hidden.
+pub const keep_gpu_when_hidden: Switch = .{
+    .key = "KeepGpuWhenHidden",
+    .env = "GHOSTTY_KEEP_GPU_WHEN_HIDDEN",
+};
+
 pub const Switch = struct {
     /// The key under com.mitchellh.ghostty in the macOS defaults.
     key: [:0]const u8,
