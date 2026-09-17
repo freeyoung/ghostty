@@ -337,6 +337,7 @@ const DerivedConfig = struct {
     links: []DerivedConfig.Link,
     link_osc8: bool,
     link_previews: configpkg.LinkPreviews,
+    link_hover_mouse_capture: bool,
     scroll_to_bottom: configpkg.Config.ScrollToBottom,
     notify_on_command_finish: configpkg.Config.NotifyOnCommandFinish,
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
@@ -417,6 +418,7 @@ const DerivedConfig = struct {
             .links = links,
             .link_osc8 = config.@"link-osc8",
             .link_previews = config.@"link-previews",
+            .link_hover_mouse_capture = linkHoverMouseCapture(),
             .scroll_to_bottom = config.@"scroll-to-bottom",
             .notify_on_command_finish = config.@"notify-on-command-finish",
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
@@ -2764,13 +2766,7 @@ pub fn keyCallback(
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
 
-        // We only refresh links if
-        // 1. mouse reporting is off
-        // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
+        if (self.linkHoverAllowed()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lockUncancelable(global.io());
@@ -2784,7 +2780,10 @@ pub fn keyCallback(
                 break :mouse_mods;
             };
         } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
-            // If we have mouse reports on and we don't have shift pressed, we reset state
+            // If we have mouse reports on and we don't have shift pressed, we reset state.
+            // The flag goes with the highlight: a link we no longer draw is a
+            // link a click must not open, and the click only reads the flag.
+            self.mouse.over_link = false;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
@@ -3965,6 +3964,13 @@ pub fn mouseButtonCallback(
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
 
+            // A highlighted link under the pointer is ours to open, so we
+            // report neither half of the click. Reporting only the press
+            // would leave the program holding a button that is never let go.
+            if (self.config.link_hover_mouse_capture and
+                self.mouse.over_link and
+                mods.ctrlOrSuper()) break :report;
+
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
             // that in any way (i.e. "scrolling").
@@ -4411,6 +4417,80 @@ fn linkAtPin(
     return null;
 }
 
+/// Whether this build was asked to highlight a link under a program that
+/// has turned mouse reporting on.
+///
+/// Each desktop keeps a switch of this kind in its own place, and this reads
+/// that place rather than the configuration file: a Ghostty from the website
+/// would warn about a setting it has never heard of, and one configuration
+/// file has to serve both.
+///
+///   macOS: defaults write com.mitchellh.ghostty LinkHoverMouseCapture -bool true
+///   Linux: GHOSTTY_LINK_HOVER_MOUSE_CAPTURE=1 in the environment
+fn linkHoverMouseCapture() bool {
+    if (comptime builtin.os.tag.isDarwin()) {
+        const macos = @import("macos");
+        const key = macos.foundation.String.createWithBytes(
+            "LinkHoverMouseCapture",
+            .utf8,
+            false,
+        ) catch return false;
+        defer key.release();
+
+        // Named rather than asked for as the current application, so that the
+        // domain is the one the command above writes whatever is reading it:
+        // the application, or the `ghostty` beside it in the bundle.
+        const domain = macos.foundation.String.createWithBytes(
+            "com.mitchellh.ghostty",
+            .utf8,
+            false,
+        ) catch return false;
+        defer domain.release();
+
+        var valid: u8 = 0;
+        const value = macos.c.CFPreferencesGetAppBooleanValue(
+            @ptrCast(key),
+            @ptrCast(domain),
+            &valid,
+        );
+        return valid != 0 and value != 0;
+    }
+
+    const value = global.environ().getPosix(
+        "GHOSTTY_LINK_HOVER_MOUSE_CAPTURE",
+    ) orelse return false;
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    return true;
+}
+
+/// Whether a link under the pointer may be highlighted.
+///
+/// A program that turns mouse reporting on owns the pointer, so we leave
+/// links alone by default: a highlight would promise something the click
+/// cannot deliver. Shift takes the pointer back from the program, and
+/// `link-hover-mouse-capture` lets a program that never asked where the
+/// pointer is keep the pointer without taking links with it.
+fn linkHoverAllowed(self: *Surface) bool {
+    const event = self.io.terminal.flags.mouse_event;
+    if (event == .none) return true;
+    if (self.mouse.mods.shift and !self.mouseShiftCapture(false)) return true;
+    if (!self.config.link_hover_mouse_capture) return false;
+
+    // A program that asked only for button reports never learns where the
+    // pointer is, so a link highlighted under it costs it nothing at all.
+    if (!terminal.mouse.eventSendsMotion(event)) return true;
+
+    // One that follows the pointer keeps every motion it asked for: this gate
+    // is only about the highlight, and a click on a highlighted link is the
+    // only thing ever withheld from it. So the link is ours while ctrl is held
+    // and the program's again the moment ctrl is let go -- which needs nothing
+    // new, the caller already refreshes the highlight on a change of modifiers
+    // and clears it when this returns false.
+    return self.mouse.mods.ctrlOrSuper();
+}
+
 /// This returns the mouse mods to consider for link highlighting or
 /// other purposes taking into account when shift is pressed for releasing
 /// the mouse from capture.
@@ -4651,8 +4731,7 @@ pub fn cursorPosCallback(
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+        self.linkHoverAllowed())
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
