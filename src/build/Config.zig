@@ -586,7 +586,6 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         for (&[_][]const u8{
             "freetype",
             "harfbuzz",
-            "fontconfig",
             "libpng",
             "zlib",
             "oniguruma",
@@ -600,6 +599,28 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
                 },
             );
         }
+
+        // Fontconfig is the system's or nothing, anywhere it is used at all.
+        //
+        // Linked statically, its symbols land in the executable's dynamic
+        // symbol table, and an executable's symbols take precedence over a
+        // shared library's. GTK is linked against the system libfontconfig
+        // and calls FcInitReinitialize when the installed fonts change --
+        // that call arrives in the static copy instead, where it destroys the
+        // FcConfig this program's font discovery is still holding a pointer
+        // to. Installing a font under a running Ghostty then segfaults it,
+        // inside FcConfigDestroy or in the next FcFontSort.
+        //
+        // Found on Omarchy, where the static build died 3 times for 3 causes
+        // that turned out to be one: a reload after fonts were installed, the
+        // same in a headless harness, and an install with no reload at all.
+        // Against the system library, a font package installed and removed
+        // and the configuration reloaded, 3 times over, left it running
+        // through all 9 events.
+        //
+        // macOS never gets here: the font backend there is CoreText and
+        // hasFontconfig() is false, so nothing asks for it either way.
+        _ = b.systemIntegrationOption("fontconfig", .{ .default = true });
 
         // These default to false because they're rarely available as
         // system packages so we usually want to statically link them.
