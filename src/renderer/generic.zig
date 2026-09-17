@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const global = @import("../global.zig");
+const fork_switch = @import("../os/fork_switch.zig");
 const xev = global.xev;
 const wuffs = @import("wuffs");
 const apprt = @import("../apprt.zig");
@@ -637,10 +638,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 font_styles.set(.bold_italic, config.@"font-style-bold-italic" != .false);
 
                 // Our link configs
-                const links = try link.Set.fromConfig(
+                var links = try link.Set.fromConfig(
                     alloc,
                     config.link.links.items,
                 );
+                links.join_hard_wraps = fork_switch.link_join_hard_wraps.enabled();
 
                 return .{
                     .background_opacity = @max(0, @min(1, config.@"background-opacity")),

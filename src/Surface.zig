@@ -21,6 +21,8 @@ const assert = @import("quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const global = @import("global.zig");
+const fork_switch = @import("os/fork_switch.zig");
+const renderer_link = @import("renderer/link.zig");
 const oni = @import("oniguruma");
 const simd = @import("simd/main.zig");
 const crash = @import("crash/main.zig");
@@ -344,6 +346,8 @@ const DerivedConfig = struct {
     links: []DerivedConfig.Link,
     link_osc8: bool,
     link_previews: configpkg.LinkPreviews,
+    link_hover_mouse_capture: bool,
+    link_join_hard_wraps: bool,
     scroll_to_bottom: configpkg.Config.ScrollToBottom,
     notify_on_command_finish: configpkg.Config.NotifyOnCommandFinish,
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
@@ -425,6 +429,8 @@ const DerivedConfig = struct {
             .links = links,
             .link_osc8 = config.@"link-osc8",
             .link_previews = config.@"link-previews",
+            .link_hover_mouse_capture = fork_switch.link_hover_mouse_capture.enabled(),
+            .link_join_hard_wraps = fork_switch.link_join_hard_wraps.enabled(),
             .scroll_to_bottom = config.@"scroll-to-bottom",
             .notify_on_command_finish = config.@"notify-on-command-finish",
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
@@ -1661,10 +1667,7 @@ fn mouseRefreshLinks(
         const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
-                const str = try self.io.terminal.screens.active.selectionString(alloc, .{
-                    .sel = link.selection,
-                    .trim = false,
-                });
+                const str = try self.regexLinkString(alloc, link.selection, false);
                 break :link .{
                     .{ .url = str },
                     self.config.link_previews == .true,
@@ -2833,13 +2836,7 @@ pub fn keyCallback(
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
 
-        // We only refresh links if
-        // 1. mouse reporting is off
-        // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
+        if (self.linkHoverAllowed()) {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
             self.renderer_state.mutex.lockUncancelable(global.io());
@@ -2853,7 +2850,10 @@ pub fn keyCallback(
                 break :mouse_mods;
             };
         } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
-            // If we have mouse reports on and we don't have shift pressed, we reset state
+            // If we have mouse reports on and we don't have shift pressed, we reset state.
+            // The flag goes with the highlight: a link we no longer draw is a
+            // link a click must not open, and the click only reads the flag.
+            self.mouse.over_link = false;
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
@@ -4034,6 +4034,13 @@ pub fn mouseButtonCallback(
             // then we do not do a mouse report.
             if (mods.shift and !shift_capture) break :report;
 
+            // A highlighted link under the pointer is ours to open, so we
+            // report neither half of the click. Reporting only the press
+            // would leave the program holding a button that is never let go.
+            if (self.config.link_hover_mouse_capture and
+                self.mouse.over_link and
+                mods.ctrlOrSuper()) break :report;
+
             // In any other mouse button scenario without shift pressed we
             // clear the selection since the underlying application can handle
             // that in any way (i.e. "scrolling").
@@ -4465,6 +4472,22 @@ fn linkAtPin(
         .semantic_prompt_boundary = true,
     }) orelse return null;
 
+    // A link that a program broke across rows by itself is matched as one.
+    // Every other line is matched as it always was, below.
+    if (self.config.link_join_hard_wraps) joined: {
+        var joined = try JoinedRows.init(self.alloc, screen, mouse_pin);
+        defer joined.deinit(self.alloc);
+        const bounds = joined.lineAround(mouse_pin) orelse break :joined;
+        if (!joined.isJoined(bounds)) break :joined;
+        return try self.linkInJoined(
+            screen,
+            &joined,
+            bounds,
+            mouse_pin,
+            mouse_mods,
+        );
+    }
+
     const strmap = try screen.selectionStringMap(self.alloc, .{
         .sel = line,
         .trim = false,
@@ -4494,6 +4517,209 @@ fn linkAtPin(
     return null;
 }
 
+/// The same as `linkAtPin`, for a line of `joined` that was carried over
+/// the hard line breaks a program broke it at. It is matched with the breaks
+/// taken out, as the renderer matches it, so what is underlined is what opens.
+fn linkInJoined(
+    self: *Surface,
+    screen: *terminal.Screen,
+    joined: *const JoinedRows,
+    bounds: [2]usize,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+) !?Link {
+    const str = joined.str.items[bounds[0]..bounds[1]];
+    const pins = joined.pins.items[bounds[0]..bounds[1]];
+
+    for (self.config.links) |link| {
+        if (mouse_mods) |mods| switch (link.highlight) {
+            .always, .hover => {},
+            .always_mods, .hover_mods => |v| if (!v.equal(mods)) continue,
+        };
+
+        // The search wants the regex mutable; this is a handle to the same one.
+        var regex = link.regex;
+        var offset: usize = 0;
+        while (offset < str.len) {
+            var region = regex.search(
+                str[offset..],
+                .{},
+            ) catch |err| switch (err) {
+                error.Mismatch => break,
+                else => return err,
+            };
+            defer region.deinit();
+
+            const start = offset + @as(usize, @intCast(region.starts()[0]));
+            const end = offset + @as(usize, @intCast(region.ends()[0]));
+            if (end == start) break;
+            defer offset = end;
+
+            const sel: terminal.Selection = .init(pins[start], pins[end - 1], false);
+            if (!sel.contains(screen, mouse_pin)) continue;
+            return .{
+                .action = link.action,
+                .selection = sel,
+            };
+        }
+    }
+
+    return null;
+}
+
+/// The rows around a pin as one string, with the hard line breaks that a
+/// link may run across taken out by `renderer_link.joinHardWraps` -- the
+/// same function the renderer uses -- and the pin of every byte left.
+const JoinedRows = struct {
+    str: std.ArrayList(u8) = .empty,
+    pins: std.ArrayList(terminal.Pin) = .empty,
+
+    /// How many rows above and below the pin are read. A link rarely runs
+    /// over more rows than this, and the pointer asks for this on every move
+    /// while the renderer lock is held.
+    const reach = 8;
+
+    fn init(
+        alloc: Allocator,
+        screen: *terminal.Screen,
+        pin: terminal.Pin,
+    ) !JoinedRows {
+        var top = pin;
+        for (0..reach) |_| top = top.up(1) orelse break;
+        top.x = 0;
+        var bottom = pin;
+        for (0..reach) |_| bottom = bottom.down(1) orelse break;
+        bottom.x = screen.pages.cols - 1;
+
+        const strmap = try screen.selectionStringMap(alloc, .{
+            .sel = .init(top, bottom, false),
+            .trim = false,
+        });
+        defer strmap.deinit(alloc);
+
+        var result: JoinedRows = .{};
+        errdefer result.deinit(alloc);
+        try result.str.appendSlice(alloc, strmap.string);
+        try result.pins.ensureTotalCapacity(alloc, strmap.string.len);
+        for (0..strmap.string.len) |i| {
+            result.pins.appendAssumeCapacity(strmap.map.get(i).?);
+        }
+
+        const len = renderer_link.joinHardWraps(
+            terminal.Pin,
+            result.str.items,
+            result.pins.items,
+            screen.pages.cols,
+        );
+        result.str.shrinkRetainingCapacity(len);
+        result.pins.shrinkRetainingCapacity(len);
+        return result;
+    }
+
+    fn deinit(self: *JoinedRows, alloc: Allocator) void {
+        self.str.deinit(alloc);
+        self.pins.deinit(alloc);
+    }
+
+    /// The bytes of the line that holds `pin`, between the line breaks that
+    /// were kept. Null where `pin` has no byte, as over a trailing blank.
+    fn lineAround(self: *const JoinedRows, pin: terminal.Pin) ?[2]usize {
+        const str = self.str.items;
+        const at = for (self.pins.items, 0..) |p, i| {
+            if (p.eql(pin)) break i;
+        } else return null;
+
+        var start = at;
+        while (start > 0 and str[start - 1] != '\n') start -= 1;
+        var end = at;
+        while (end < str.len and str[end] != '\n') end += 1;
+        return .{ start, end };
+    }
+
+    /// Whether a hard line break was taken out inside these bytes. A soft
+    /// wrap was never there to take out.
+    fn isJoined(self: *const JoinedRows, bounds: [2]usize) bool {
+        const pins = self.pins.items[bounds[0]..bounds[1]];
+        if (pins.len < 2) return false;
+        for (pins[0 .. pins.len - 1], pins[1..]) |a, b| {
+            if (a.node == b.node and a.y == b.y) continue;
+            if (!a.rowAndCell().row.wrap) return true;
+        }
+        return false;
+    }
+
+    /// The text from `sel.start()` to `sel.end()`, null if either has no byte.
+    fn text(
+        self: *const JoinedRows,
+        alloc: Allocator,
+        sel: terminal.Selection,
+    ) !?[:0]const u8 {
+        const pins = self.pins.items;
+        const first = for (pins, 0..) |p, i| {
+            if (p.eql(sel.start())) break i;
+        } else return null;
+        // The line break after a row is mapped to the last cell of it, so
+        // the last byte at the end pin can be a break that was kept.
+        var last: ?usize = null;
+        for (pins[first..], first..) |p, i| {
+            if (p.eql(sel.end()) and self.str.items[i] != '\n') last = i;
+        }
+        return try alloc.dupeZ(u8, self.str.items[first .. (last orelse return null) + 1]);
+    }
+};
+
+/// The text of a regex link. A link matched across hard line breaks, see
+/// `linkInJoined`, comes without them and without what led up to the text
+/// after them, which is the link the program meant.
+fn regexLinkString(
+    self: *Surface,
+    alloc: Allocator,
+    sel: terminal.Selection,
+    trim: bool,
+) ![:0]const u8 {
+    const screen = self.io.terminal.screens.active;
+    const start = sel.start();
+    const end = sel.end();
+    if (self.config.link_join_hard_wraps and
+        (start.node != end.node or start.y != end.y))
+    {
+        var joined = try JoinedRows.init(alloc, screen, start);
+        defer joined.deinit(alloc);
+        if (try joined.text(alloc, sel)) |str| return str;
+    }
+
+    return try screen.selectionString(alloc, .{
+        .sel = sel,
+        .trim = trim,
+    });
+}
+
+/// Whether a link under the pointer may be highlighted.
+///
+/// A program that turns mouse reporting on owns the pointer, so we leave
+/// links alone by default: a highlight would promise something the click
+/// cannot deliver. Shift takes the pointer back from the program, and
+/// `link-hover-mouse-capture` lets a program that never asked where the
+/// pointer is keep the pointer without taking links with it.
+fn linkHoverAllowed(self: *Surface) bool {
+    const event = self.io.terminal.flags.mouse_event;
+    if (event == .none) return true;
+    if (self.mouse.mods.shift and !self.mouseShiftCapture(false)) return true;
+    if (!self.config.link_hover_mouse_capture) return false;
+
+    // A program that asked only for button reports never learns where the
+    // pointer is, so a link highlighted under it costs it nothing at all.
+    if (!terminal.mouse.eventSendsMotion(event)) return true;
+
+    // One that follows the pointer keeps every motion it asked for: this gate
+    // is only about the highlight, and a click on a highlighted link is the
+    // only thing ever withheld from it. So the link is ours while ctrl is held
+    // and the program's again the moment ctrl is let go -- which needs nothing
+    // new, the caller already refreshes the highlight on a change of modifiers
+    // and clears it when this returns false.
+    return self.mouse.mods.ctrlOrSuper();
+}
+
 /// This returns the mouse mods to consider for link highlighting or
 /// other purposes taking into account when shift is pressed for releasing
 /// the mouse from capture.
@@ -4521,10 +4747,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
     const link = try self.linkAtPos(pos) orelse return false;
     switch (link.action) {
         .open => {
-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
-                .sel = link.selection,
-                .trim = false,
-            });
+            const str = try self.regexLinkString(self.alloc, link.selection, false);
             defer self.alloc.free(str);
 
             const resolved_path = try self.resolvePathForOpening(str);
@@ -4734,8 +4957,7 @@ pub fn cursorPosCallback(
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+        self.linkHoverAllowed())
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
@@ -5163,10 +5385,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
                         // For regex links, get the text from selection
-                        break :url_text (self.io.terminal.screens.active.selectionString(self.alloc, .{
-                            .sel = link_info.selection,
-                            .trim = self.config.clipboard_trim_trailing_spaces,
-                        })) catch |err| {
+                        break :url_text self.regexLinkString(
+                            self.alloc,
+                            link_info.selection,
+                            self.config.clipboard_trim_trailing_spaces,
+                        ) catch |err| {
                             log.err("error reading url string err={}", .{err});
                             return false;
                         };
@@ -6698,4 +6921,92 @@ test "promptClickRelativeRow" {
         );
         try testing.expectEqual(case.expected, promptClickRelativeRow(&pages, prompt, click));
     }
+}
+
+test "JoinedRows carries a link a program broke at the edge" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
+        .cols = 8,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    // The program broke the link itself and indented the rest. The third
+    // row stops short of the edge, so the line ends there.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("  ABCDEF\r\n  GHIJKL\r\n  MN\r\n  OP");
+
+    const screen = t.screens.active;
+    const pin = screen.pages.pin(.{ .active = .{ .x = 3, .y = 1 } }).?;
+    var joined = try JoinedRows.init(alloc, screen, pin);
+    defer joined.deinit(alloc);
+
+    const bounds = joined.lineAround(pin).?;
+    try testing.expect(joined.isJoined(bounds));
+    try testing.expectEqualStrings(
+        "  ABCDEFGHIJKLMN",
+        joined.str.items[bounds[0]..bounds[1]],
+    );
+
+    // The text a click opens has no break in it either.
+    const pins = joined.pins.items;
+    const sel: terminal.Selection = .init(pins[bounds[0] + 2], pins[bounds[1] - 1], false);
+    const text = (try joined.text(alloc, sel)).?;
+    defer alloc.free(text);
+    try testing.expectEqualStrings("ABCDEFGHIJKLMN", text);
+}
+
+test "JoinedRows looks past a pane border for the rest of the link" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // As herdr draws it: a sidebar, a border, and the pane, whose program
+    // broke the link at the right edge and indented the rest.
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
+        .cols = 16,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(" spaces│  ABCDEF\r\n master│  GHIJ\r\n       │  KL");
+
+    const screen = t.screens.active;
+    const pin = screen.pages.pin(.{ .active = .{ .x = 11, .y = 1 } }).?;
+    var joined = try JoinedRows.init(alloc, screen, pin);
+    defer joined.deinit(alloc);
+
+    // The sidebar of the second row is not part of the link, and the second
+    // row stops short of the edge, so the third is not either.
+    const bounds = joined.lineAround(pin).?;
+    try testing.expect(joined.isJoined(bounds));
+    try testing.expectEqualStrings(
+        " spaces│  ABCDEFGHIJ",
+        joined.str.items[bounds[0]..bounds[1]],
+    );
+}
+
+test "JoinedRows leaves a line that stops short of the edge" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
+        .cols = 8,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("  ABC\r\n  DEF");
+
+    const screen = t.screens.active;
+    const pin = screen.pages.pin(.{ .active = .{ .x = 3, .y = 1 } }).?;
+    var joined = try JoinedRows.init(alloc, screen, pin);
+    defer joined.deinit(alloc);
+    try testing.expect(!joined.isJoined(joined.lineAround(pin).?));
 }

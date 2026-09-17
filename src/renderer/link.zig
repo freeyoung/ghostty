@@ -43,6 +43,10 @@ pub const Link = struct {
 pub const Set = struct {
     links: []Link,
 
+    /// Match a link across a hard line break where a program wrapped it by
+    /// itself. See `joinHardWraps`.
+    join_hard_wraps: bool = false,
+
     /// Returns the slice of links from the configuration.
     pub fn fromConfig(
         alloc: Allocator,
@@ -98,7 +102,17 @@ pub const Set = struct {
             .map = &map,
         });
 
-        const str = builder.writer.buffered();
+        var str = builder.writer.buffered();
+        if (self.join_hard_wraps) {
+            const len = joinHardWraps(
+                point.Coordinate,
+                str,
+                map.items,
+                render_state.cols,
+            );
+            str = str[0..len];
+            map.shrinkRetainingCapacity(len);
+        }
 
         // Go through each link and see if we have any matches.
         for (self.links) |*link| {
@@ -143,6 +157,118 @@ pub const Set = struct {
         }
     }
 };
+
+/// Removes, in place, every hard line break that a link may run across, with
+/// the blanks at the end of the row before it and whatever leads up to the
+/// text of the row after it. Returns the new length; `pts`, one point per byte
+/// of `str` with the column of that byte in `x`, is compacted to match.
+///
+/// A program that lays out its own text, as Claude Code does, breaks a long
+/// URL with a line break of its own and indents what follows, so to the
+/// terminal the two halves are two lines and each half alone is the link.
+/// The sign that a break is the program's and not the text's is that the
+/// text ran up to the right edge: within the last two columns, as some
+/// programs keep the last column empty. What follows must start, past the
+/// indent, with text that a link can hold.
+///
+/// Under a multiplexer the program's rows start partway along the terminal's:
+/// herdr draws a sidebar and a `│` to the left of the pane on every row. So
+/// when a pane border stands to the left of the text, what follows is looked
+/// for past the same border in the same column of the next row, and the
+/// sidebar in front of it is dropped with the indent.
+///
+/// A URL that happens to end right at the edge takes the first word of the
+/// next row with it. That is the price of the guess.
+pub fn joinHardWraps(
+    comptime Point: type,
+    str: []u8,
+    pts: []Point,
+    cols: usize,
+) usize {
+    assert(str.len == pts.len);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < str.len) {
+        if (str[i] == '\n') join: {
+            // The last text of the row, which has to be at the right edge.
+            var j = w;
+            while (j > 0 and blankByte(str[j - 1])) j -= 1;
+            if (j == 0 or !linkChar(str[j - 1])) break :join;
+            if (@as(usize, pts[j - 1].x) + 2 < cols) break :join;
+
+            // Past the pane border of the next row, if this row has one.
+            var k = i + 1;
+            if (paneBorderBefore(Point, str[0..j], pts[0..j])) |b| {
+                while (k < str.len and str[k] != '\n' and pts[k].x < b.x) k += 1;
+                if (k + b.len > str.len or pts[k].x != b.x) break :join;
+                if (!std.mem.eql(u8, str[k..][0..b.len], b.bytes[0..b.len])) break :join;
+                k += b.len;
+            }
+
+            // Past the indent, the text has to be something a link holds.
+            while (k < str.len and blankByte(str[k])) k += 1;
+            if (k == str.len or !linkChar(str[k])) break :join;
+
+            w = j;
+            i = k;
+            continue;
+        }
+
+        str[w] = str[i];
+        pts[w] = pts[i];
+        w += 1;
+        i += 1;
+    }
+
+    return w;
+}
+
+/// The rightmost pane border on the last row of `str`, which ends with the
+/// text a link would go on from.
+fn paneBorderBefore(
+    comptime Point: type,
+    str: []const u8,
+    pts: []const Point,
+) ?struct { x: usize, bytes: [4]u8, len: usize } {
+    var idx = str.len;
+    while (idx > 0) {
+        idx -= 1;
+        const b = str[idx];
+        if (b == '\n') return null;
+
+        // Only the first byte of a sequence says how long it is.
+        if (b & 0xC0 == 0x80) continue;
+        const len = std.unicode.utf8ByteSequenceLength(b) catch continue;
+        if (idx + len > str.len) continue;
+        const cp = std.unicode.utf8Decode(str[idx..][0..len]) catch continue;
+        if (!paneBorder(cp)) continue;
+
+        var bytes: [4]u8 = undefined;
+        @memcpy(bytes[0..len], str[idx..][0..len]);
+        return .{ .x = pts[idx].x, .bytes = bytes, .len = len };
+    }
+    return null;
+}
+
+/// The vertical lines a multiplexer draws between a pane and what is beside
+/// it: herdr and tmux use the light one, and the others are common in themes.
+fn paneBorder(cp: u21) bool {
+    return switch (cp) {
+        0x2502, 0x2503, 0x2551 => true,
+        else => false,
+    };
+}
+
+/// Printable ASCII other than the space. A border, a bullet or any wider
+/// character ends a link here rather than continuing it.
+fn linkChar(b: u8) bool {
+    return b > ' ' and b < 0x7F;
+}
+
+/// A cell the renderer writes as nothing at all is a NUL.
+fn blankByte(b: u8) bool {
+    return b == ' ' or b == 0;
+}
 
 test "renderCellMap" {
     const testing = std.testing;
@@ -388,4 +514,130 @@ test "renderCellMap mods no match" {
     try testing.expect(!result.contains(.{ .x = 3, .y = 0 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 1 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 2 }));
+}
+
+test "renderCellMap joins a link a program broke at the right edge" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
+        .cols = 6,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    // The program breaks the link itself and indents what follows, so the
+    // terminal sees two lines and no soft wrap.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("  ABCD\r\n  EFGH");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var set = try Set.fromConfig(alloc, &.{.{
+        .regex = "ABCDEFGH",
+        .action = .{ .open = {} },
+        .highlight = .{ .hover = {} },
+    }});
+    defer set.deinit(alloc);
+
+    // Without joining, neither half matches on its own.
+    {
+        var result: terminal.RenderState.CellSet = .empty;
+        defer result.deinit(alloc);
+        try set.renderCellMap(alloc, &result, &state, .{ .x = 3, .y = 1 }, .{});
+        try testing.expectEqual(@as(usize, 0), result.count());
+    }
+
+    // Hovering the second half finds the whole link, both rows of it.
+    set.join_hard_wraps = true;
+    {
+        var result: terminal.RenderState.CellSet = .empty;
+        defer result.deinit(alloc);
+        try set.renderCellMap(alloc, &result, &state, .{ .x = 3, .y = 1 }, .{});
+        try testing.expectEqual(@as(usize, 8), result.count());
+        try testing.expect(!result.contains(.{ .x = 1, .y = 0 }));
+        try testing.expect(result.contains(.{ .x = 2, .y = 0 }));
+        try testing.expect(result.contains(.{ .x = 5, .y = 0 }));
+        try testing.expect(!result.contains(.{ .x = 1, .y = 1 }));
+        try testing.expect(result.contains(.{ .x = 2, .y = 1 }));
+        try testing.expect(result.contains(.{ .x = 5, .y = 1 }));
+    }
+}
+
+test "renderCellMap does not join a row that stops short of the edge" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
+        .cols = 8,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    // Ends in column 4 of 8: the text ended there, nothing broke it.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("  ABC\r\n  DEFGH");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var set = try Set.fromConfig(alloc, &.{.{
+        .regex = "ABCDEFGH",
+        .action = .{ .open = {} },
+        .highlight = .{ .always = {} },
+    }});
+    defer set.deinit(alloc);
+    set.join_hard_wraps = true;
+
+    var result: terminal.RenderState.CellSet = .empty;
+    defer result.deinit(alloc);
+    try set.renderCellMap(alloc, &result, &state, null, .{});
+    try testing.expectEqual(@as(usize, 0), result.count());
+}
+
+test "renderCellMap looks past a pane border for the rest of the link" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // As herdr draws it: a sidebar, a border, and the pane, whose program
+    // broke the link at the right edge and indented the rest.
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
+        .cols = 16,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(" spaces\u{2502}  ABCDEF\r\n master\u{2502}  GHIJ");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var set = try Set.fromConfig(alloc, &.{.{
+        .regex = "ABCDEFGHIJ",
+        .action = .{ .open = {} },
+        .highlight = .{ .hover = {} },
+    }});
+    defer set.deinit(alloc);
+    set.join_hard_wraps = true;
+
+    var result: terminal.RenderState.CellSet = .empty;
+    defer result.deinit(alloc);
+    try set.renderCellMap(alloc, &result, &state, .{ .x = 11, .y = 1 }, .{});
+    try testing.expectEqual(@as(usize, 10), result.count());
+    try testing.expect(result.contains(.{ .x = 10, .y = 0 }));
+    try testing.expect(result.contains(.{ .x = 15, .y = 0 }));
+    try testing.expect(result.contains(.{ .x = 10, .y = 1 }));
+    try testing.expect(result.contains(.{ .x = 13, .y = 1 }));
+
+    // Nothing of the sidebar, which the old rule would have taken for the
+    // rest of the link.
+    try testing.expect(!result.contains(.{ .x = 1, .y = 1 }));
 }
