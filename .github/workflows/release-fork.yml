@@ -1,0 +1,318 @@
+name: Release Fork
+
+# Push a tag named vX.Y.Z-fork.N to build this fork for macOS (Apple
+# silicon, the app in a zip) and Linux (x86-64, pacman packages) and publish
+# a GitHub Release with both. X.Y.Z is the version build.zig.zon carries,
+# without its -dev, and N counts this fork's releases of it from 1:
+# v1.3.2-fork.1, v1.3.2-fork.2, and v1.3.3-fork.1 once upstream has moved on.
+# The first job refuses a tag of any other shape, or one whose X.Y.Z is not
+# the one the tree says.
+#
+# The one version is spelled 4 ways, each by the rules of what reads it:
+#
+#   tag, GitHub Release   v1.3.2-fork.1
+#   Ghostty (Zig)         1.3.2-fork.1     a semantic version, which
+#                                          `ghostty +version` prints; sorts
+#                                          after 1.3.2-dev, before 1.3.2
+#   macOS                 1.3.2 (18012)    CFBundleShortVersionString takes 3
+#                                          integers and no more, so the fork
+#                                          number is not in it; CFBundleVersion
+#                                          counts the commits, as upstream's
+#                                          releases do, and GhosttyCommit,
+#                                          which About shows, names the build
+#   pacman                1.3.2.fork1-1    no hyphen allowed; vercmp sorts it
+#                                          after Arch's 1.3.2 and before its
+#                                          1.3.3, and fork9 before fork10
+#
+# A run by hand gets N = 0 and the commit: 1.3.2-fork.0+g<hash> and
+# 1.3.2.fork0.g<hash>, below every release of the same X.Y.Z.
+#
+# Upstream's own workflows, which this repository carries beside this one,
+# are disabled in the repository's settings rather than deleted: they need
+# Ghostty's own runners, and deleting them would conflict with every change
+# upstream makes to them.
+#
+# The files never pass through Actions artifacts on a tag run: each package
+# job uploads into a draft release that the first job makes, and the last
+# one writes the notes and publishes it. A failed run leaves the draft; run
+# the tag again and the uploads replace its files. Run it by hand
+# (workflow_dispatch) on a branch to build without publishing: the files are
+# left as workflow artifacts for a day.
+#
+# No job saves a cache. A cache saved by a tag run can be read only by that
+# tag, and every release is a new tag.
+#
+# Secrets:
+#   MAC_CERT_P12, MAC_CERT_PASSWORD   the self-signed "Ghostty Local Signing"
+#     identity that dist/macos/signing-identity.sh makes, exported from the
+#     keychain as a p12 and base64-encoded. A fixed certificate keeps the
+#     app one program to macOS across releases and across the builds made on
+#     the Mac, so what it has been granted stays granted. Without it the app
+#     is signed ad hoc.
+#
+# There is no Apple Developer ID: the app is not notarized, so a downloaded
+# one needs `xattr -dr com.apple.quarantine /Applications/Ghostty.app` once.
+
+on:
+  push:
+    tags:
+      - "v*-fork.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-fork-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    name: Work out the version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      semver: ${{ steps.version.outputs.semver }}
+      pkgver: ${{ steps.version.outputs.pkgver }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Work out the version
+        id: version
+        run: |
+          set -euo pipefail
+          base=$(sed -nE 's/^[[:space:]]*\.version = "([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' build.zig.zon | head -1)
+          [ -n "$base" ] || { echo "::error::no version in build.zig.zon"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            re='^v([0-9]+\.[0-9]+\.[0-9]+)-fork\.([1-9][0-9]*)$'
+            if [[ ! $GITHUB_REF_NAME =~ $re ]]; then
+              echo "::error::$GITHUB_REF_NAME is not vX.Y.Z-fork.N"
+              exit 1
+            fi
+            if [ "${BASH_REMATCH[1]}" != "$base" ]; then
+              echo "::error::the tag says ${BASH_REMATCH[1]}, build.zig.zon says $base"
+              exit 1
+            fi
+            n=${BASH_REMATCH[2]}
+            semver="$base-fork.$n"
+            pkgver="$base.fork$n"
+          else
+            hash=$(git rev-parse --short HEAD)
+            semver="$base-fork.0+g$hash"
+            pkgver="$base.fork0.g$hash"
+          fi
+          echo "semver=$semver" | tee -a "$GITHUB_OUTPUT"
+          echo "pkgver=$pkgver" | tee -a "$GITHUB_OUTPUT"
+
+      # Every run passes through here so the package jobs can wait on it;
+      # only a tag run has a release to make. A draft already there (a run
+      # again over a failed one) is kept, and the uploads replace its files.
+      - name: Make the draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SEMVER: ${{ steps.version.outputs.semver }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "Ghostty $SEMVER" --notes "Building."
+
+  mac:
+    name: Package (macOS)
+    needs: setup
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      # The whole history: CFBundleVersion counts its commits.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The Xcode upstream builds its releases with, named rather than taken
+      # as the image's default, which moves.
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcodebuild -version
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      # release-local.sh signs with the identity when a keychain on the
+      # search list holds it. A keychain of the run's own takes the p12, and
+      # the system is told to trust the certificate for code signing, which a
+      # self-signed one is not until told so.
+      - name: Import the signing certificate
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MAC_CERT_P12" ]; then
+            echo "No signing certificate; the app will be signed ad hoc."
+            exit 0
+          fi
+          p12="$RUNNER_TEMP/signing.p12"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          echo "$MAC_CERT_P12" | base64 --decode > "$p12"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          security import "$p12" -k "$keychain" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$keychain" > /dev/null
+          # Split on purpose: each keychain already on the list is a word.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          # OpenSSL 3 needs -legacy for the RC2 certificate bag the keychain
+          # exports; LibreSSL has no such flag and reads it as is.
+          openssl pkcs12 -in "$p12" -passin env:MAC_CERT_PASSWORD -nokeys -legacy -out "$RUNNER_TEMP/signing.pem" 2>/dev/null ||
+            openssl pkcs12 -in "$p12" -passin env:MAC_CERT_PASSWORD -nokeys -out "$RUNNER_TEMP/signing.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/signing.pem"
+          security find-identity -v -p codesigning "$keychain"
+
+      # The same script the Mac builds with, so that the two cannot drift.
+      - name: Build
+        env:
+          GHOSTTY_VERSION_STRING: ${{ needs.setup.outputs.semver }}
+        run: dist/macos/release-local.sh --full
+
+      - name: Package
+        env:
+          SEMVER: ${{ needs.setup.outputs.semver }}
+        run: |
+          app=macos/build/ReleaseLocal/Ghostty.app
+          lipo -archs "$app/Contents/MacOS/ghostty"
+          codesign -d -r- "$app" 2>&1 | grep designated
+          plutil -p "$app/Contents/Info.plist" | grep -E '"(CFBundleShortVersionString|CFBundleVersion|GhosttyCommit)"'
+          # Upstream's Sparkle key must not ship; see release-local.sh.
+          if plutil -p "$app/Contents/Info.plist" | grep -q SUPublicEDKey; then
+            echo "::error::the app still carries upstream's SUPublicEDKey"
+            exit 1
+          fi
+          "$app/Contents/MacOS/ghostty" +version
+          mkdir -p dist/out
+          ditto -c -k --keepParent "$app" "dist/out/Ghostty-$SEMVER-macos-arm64.zip"
+          ls -l dist/out
+
+      - name: Upload to the draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/out/* --clobber
+
+      - uses: actions/upload-artifact@v7
+        if: github.ref_type != 'tag'
+        with:
+          name: release-macos
+          path: dist/out/*
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    name: Package (Linux)
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Arch, because the packages are for Arch: makepkg, and the libraries
+    # the binary links against are the ones a pacman system has.
+    container:
+      image: archlinux:base-devel
+    steps:
+      # Before the checkout: without git in the container, actions/checkout
+      # downloads a tarball with no history, and the version below counts it.
+      - name: Tools for the job
+        run: pacman -Syu --noconfirm --needed git github-cli
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build the packages
+        env:
+          PKGVER: ${{ needs.setup.outputs.pkgver }}
+          SEMVER: ${{ needs.setup.outputs.semver }}
+        run: |
+          set -euo pipefail
+          # The checkout belongs to another user than the container's root.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # makepkg refuses to run as root, and this container is root.
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          install -d -o builder /build
+          git archive HEAD --prefix=ghostty/ -o /build/ghostty.tar.gz
+          cp dist/linux/PKGBUILD /build/PKGBUILD
+          sed -i -e "s/^pkgver=.*/pkgver=$PKGVER/" -e "s/^_semver=.*/_semver=$SEMVER/" /build/PKGBUILD
+          chown -R builder:builder /build
+          # -s so the dependency list in the PKGBUILD is the only place the
+          # dependencies are written down.
+          cd /build && sudo -u builder makepkg -s --noconfirm --noprogressbar
+          mkdir -p "$GITHUB_WORKSPACE/dist/out"
+          cp /build/*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/out/"
+          ls -l "$GITHUB_WORKSPACE/dist/out"
+
+      - name: Say what the binary links against
+        env:
+          PKGVER: ${{ needs.setup.outputs.pkgver }}
+        run: |
+          set -euo pipefail
+          # The point of building on Arch rather than on the Mac. A missing or
+          # unexpected shared library shows up in this list, not in the exit
+          # code of the compiler.
+          bsdtar -xOf dist/out/ghostty-"$PKGVER"-*.pkg.tar.zst usr/bin/ghostty > /tmp/ghostty
+          chmod +x /tmp/ghostty
+          ldd /tmp/ghostty
+
+      - name: Upload to the draft release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/out/* --clobber
+
+      - uses: actions/upload-artifact@v7
+        if: github.ref_type != 'tag'
+        with:
+          name: release-linux
+          path: dist/out/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish the release
+    if: github.ref_type == 'tag'
+    needs: [setup, mac, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The notes list what this fork adds to Ghostty: its commits since the
+      # point where it left upstream's main, which is fetched for that alone.
+      - name: Write the notes and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SEMVER: ${{ needs.setup.outputs.semver }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/ghostty-org/ghostty main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          {
+            printf 'Ghostty %s, built from %s: upstream %s with what this fork adds:\n\n' \
+              "$SEMVER" "$(git rev-parse --short HEAD)" "$(git rev-parse --short "$base")"
+            git log --reverse --format='- %s' "$base..HEAD"
+            printf '\nmacOS, Apple silicon. Not notarized, so a downloaded app needs once:\n\n'
+            printf '    xattr -dr com.apple.quarantine /Applications/Ghostty.app\n'
+            printf '\nLinux, x86-64, Arch based. Download every .pkg.tar.zst into one directory\n'
+            printf 'and install them together:\n\n'
+            printf '    sudo pacman -U ./*.pkg.tar.zst\n'
+          } > notes.md
+          cat notes.md
+          # Not a prerelease, although the version is one: to this fork it is
+          # the release, and GitHub should call it the latest.
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease=false --latest --notes-file notes.md

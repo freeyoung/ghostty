@@ -1,0 +1,116 @@
+# A pacman package of this Ghostty, for Omarchy and anything else Arch based.
+#
+# This is Arch's own ghostty recipe with the source swapped for our checkout.
+# The dependency list below is theirs, and it is the reason this file is a copy
+# rather than something written from scratch: Arch maintains it, so when
+# upstream Ghostty adds a library we refresh this from
+#
+#   https://gitlab.archlinux.org/archlinux/packaging/packages/ghostty
+#
+# rather than discover the new dependency from a red build.
+#
+# The split into ghostty, ghostty-shell-integration and ghostty-terminfo is
+# theirs as well, and it is kept so these packages are a drop-in replacement:
+# pacman sees the same 3 names it already has and upgrades them in place.
+# ghostty-nautilus is dropped because it pulls in nautilus-python for a GNOME
+# Files context menu that this build has no use for.
+#
+# pkgver and _semver are placeholders. The workflow that builds this fills
+# both in from the tag, because the one version has 2 spellings: pacman's may
+# hold no hyphen, and Zig's must be a semantic version, where everything past
+# the patch number is a prerelease behind one. v1.3.2-fork.1 is 1.3.2.fork1 to
+# pacman, which sorts above Arch's 1.3.2 and below its 1.3.3, and 1.3.2-fork.1
+# to Zig, which sorts above the 1.3.2-dev it is built from.
+
+pkgbase=ghostty
+pkgname=(ghostty ghostty-shell-integration ghostty-terminfo)
+pkgver=0
+_semver=0
+pkgrel=1
+pkgdesc='Fast, native, feature-rich terminal emulator pushing modern features'
+arch=(x86_64)
+url="https://github.com/ghostty-org/ghostty"
+license=(MIT)
+depends=(bzip2
+         fontconfig libfontconfig.so
+         freetype2 libfreetype.so
+         glibc # libc.so libm.so
+         glib2 libglib-2.0.so libgio-2.0.so libgobject-2.0.so
+         gtk4 libgtk-4.so
+         gtk4-layer-shell
+         libx11 # libX11.so
+         harfbuzz libharfbuzz.so
+         libadwaita libadwaita-1.so
+         libpng
+         oniguruma # libonig.so
+         pixman
+         wayland libwayland-client.so
+         zlib)
+makedepends=(blueprint-compiler
+             pandoc-cli
+             zig)
+source=("ghostty.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+	cd ghostty
+	# Arch runs nix/build-support/fetch-zig-cache.sh here and then builds with
+	# --system against that directory, because a distribution package must
+	# build with no network. On this tip that leaves 2 of the 39 dependencies
+	# unresolved -- uucode and translate_c are fetched, and the build then says
+	# "package not found" for both -- and this job has a network, so it fetches
+	# the ordinary way instead and the offline path stops mattering. Why those
+	# 2 do not land was not established; Zig is 0.16.0 there, the version the
+	# build asks for, so it is not that.
+	export ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-cache"
+	# -Dversion-string, where Arch passes "$pkgver-arch$pkgrel": the tarball
+	# carries no .git, so the build cannot read the version from a describe and
+	# would call itself 1.3.2-dev+0000000. It is told what it is instead.
+	#
+	# Not pkgver itself, but _semver, the same version spelled the way Zig
+	# parses it (see the top of this file). Passing the pacman spelling fails
+	# the build with error.InvalidVersion.
+	# -Dstrip=false, which Arch does not pass: a fast release strips by
+	# default, so Zig drops the symbols before makepkg can split them out, and
+	# ghostty-debug comes out holding a 3 KB file with no debug info at all.
+	# Kept, makepkg moves them into ghostty-debug and strips the binary itself,
+	# so the ghostty that runs is no larger and no slower.
+	DESTDIR=build zig build \
+		--summary all \
+		--prefix "/usr" \
+		-Doptimize=ReleaseFast \
+		-Dstrip=false \
+		-Dgtk-x11=true \
+		-Dcpu=baseline \
+		-Dpie=true \
+		-Demit-docs \
+		-Dversion-string="$_semver" \
+		--build-id=sha1
+}
+
+package_ghostty() {
+	depends+=(ghostty-shell-integration
+	          ghostty-terminfo)
+	cd ghostty
+	cp -a build/* "$pkgdir/"
+	install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE
+	rm -r "$pkgdir"/usr/share/terminfo
+	rm -r "$pkgdir"/usr/share/ghostty/shell-integration
+	rm -r "$pkgdir"/usr/share/nautilus-python/
+}
+
+package_ghostty-shell-integration() {
+	pkgdesc='Shell integration scripts for ghostty'
+	depends=()
+	cd ghostty
+	mkdir -p "$pkgdir/usr/share/ghostty/shell-integration"
+	cp -r build/usr/share/ghostty/shell-integration/* "$pkgdir/usr/share/ghostty/shell-integration/"
+}
+
+package_ghostty-terminfo() {
+	pkgdesc='Terminfo for ghostty'
+	depends=()
+	cd ghostty
+	mkdir -p "$pkgdir/usr/share/terminfo"
+	cp -r build/usr/share/terminfo/x "$pkgdir/usr/share/terminfo/"
+}

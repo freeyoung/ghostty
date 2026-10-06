@@ -310,7 +310,14 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         };
         if (vsn.tag) |tag| {
             // Tip releases behave just like any other pre-release so we skip.
-            if (!std.mem.eql(u8, tag, "tip")) {
+            //
+            // So do the vX.Y.Z-fork.N tags that this fork's releases are made
+            // from. The release passes -Dversion-string and never gets here,
+            // but a build made from the same commit without one does, and it
+            // would panic below on a tag that is not vX.Y.Z.
+            if (!std.mem.eql(u8, tag, "tip") and
+                std.mem.indexOf(u8, tag, "-fork.") == null)
+            {
                 const expected = b.fmt("v{d}.{d}.{d}", .{
                     app_version.major,
                     app_version.minor,
