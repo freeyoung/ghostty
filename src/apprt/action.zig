@@ -326,6 +326,10 @@ pub const Action = union(Key) {
     /// Show a native GUI notification about the progress of some TUI operation.
     progress_report: terminal.osc.Command.ProgressReport,
 
+    /// Say what the program in a surface is doing, from a report it sent
+    /// through OSC 7501.
+    program_status: ProgramStatus,
+
     /// Show the on-screen keyboard.
     show_on_screen_keyboard,
 
@@ -426,6 +430,7 @@ pub const Action = union(Key) {
         open_url,
         show_child_exited,
         progress_report,
+        program_status,
         show_on_screen_keyboard,
         command_finished,
         start_search,
@@ -678,6 +683,28 @@ pub const Readonly = enum(c_int) {
 
     test "ghostty.h Readonly" {
         try lib.checkGhosttyHEnum(Readonly, "GHOSTTY_READONLY_");
+    }
+};
+
+/// What the program in a surface says it is doing, from OSC 7501.
+///
+/// The protocol's own states, with 2 differences. `clear` becomes `none`,
+/// because the record is kept by whoever displays it and an empty record and
+/// no record look the same there. `error` becomes `failed`, because `error` is
+/// a Zig keyword.
+///
+/// The order is the order of interest, so a window that shows one state for
+/// several surfaces can show the highest.
+pub const ProgramStatus = enum(c_int) {
+    none,
+    idle,
+    done,
+    working,
+    blocked,
+    failed,
+
+    test "ghostty.h ProgramStatus" {
+        try lib.checkGhosttyHEnum(ProgramStatus, "GHOSTTY_PROGRAM_STATUS_");
     }
 };
 

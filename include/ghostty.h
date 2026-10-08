@@ -773,6 +773,16 @@ typedef enum {
   GHOSTTY_MOUSE_SHAPE_ZOOM_OUT,
 } ghostty_action_mouse_shape_e;
 
+// apprt.action.ProgramStatus
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_NONE,
+  GHOSTTY_PROGRAM_STATUS_IDLE,
+  GHOSTTY_PROGRAM_STATUS_DONE,
+  GHOSTTY_PROGRAM_STATUS_WORKING,
+  GHOSTTY_PROGRAM_STATUS_BLOCKED,
+  GHOSTTY_PROGRAM_STATUS_FAILED,
+} ghostty_action_program_status_e;
+
 // apprt.action.MouseVisibility
 typedef enum {
   GHOSTTY_MOUSE_VISIBLE,
@@ -1006,6 +1016,7 @@ typedef enum {
   GHOSTTY_ACTION_OPEN_URL,
   GHOSTTY_ACTION_SHOW_CHILD_EXITED,
   GHOSTTY_ACTION_PROGRESS_REPORT,
+  GHOSTTY_ACTION_PROGRAM_STATUS,
   GHOSTTY_ACTION_SHOW_ON_SCREEN_KEYBOARD,
   GHOSTTY_ACTION_COMMAND_FINISHED,
   GHOSTTY_ACTION_START_SEARCH,
@@ -1054,6 +1065,7 @@ typedef union {
   ghostty_action_close_tab_mode_e close_tab_mode;
   ghostty_surface_message_childexited_s child_exited;
   ghostty_action_progress_report_s progress_report;
+  ghostty_action_program_status_e program_status;
   ghostty_action_command_finished_s command_finished;
   ghostty_action_start_search_s start_search;
   ghostty_action_search_total_s search_total;

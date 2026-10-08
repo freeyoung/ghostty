@@ -383,12 +383,13 @@ pub const StreamHandler = struct {
             .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
             .kitty_clipboard => try self.kittyClipboard(value),
 
+            .program_status => try self.programStatus(value),
+
             // Unimplemented
             .title_push,
             .title_pop,
             .kitty_dnd,
             .osc_unknown,
-            .program_status,
             => {},
         }
     }
@@ -1925,6 +1926,46 @@ pub const StreamHandler = struct {
     /// Display a GUI progress report.
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
+    }
+
+    /// OSC 7501, the program status protocol: a program saying what it is
+    /// doing, or asking whether this terminal listens.
+    fn programStatus(
+        self: *StreamHandler,
+        cmd: terminal.osc.Command.ProgramStatus,
+    ) !void {
+        switch (cmd) {
+            // A program that gets no reply takes the protocol for
+            // unsupported and sends no reports, so the reply is what turns
+            // the rest of this on. It is the same sequence back.
+            .query => |terminator| {
+                var buf: [16]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&buf);
+                try writer.writeAll("\x1b]7501;?");
+                try writer.writeAll(terminator.string());
+                const msg = try termio.Message.writeReq(
+                    self.alloc,
+                    writer.buffered(),
+                );
+                self.messageWriter(msg);
+            },
+
+            // Only the state reaches the apprt. The protocol carries an id,
+            // a progress percentage and text as well, and nothing here shows
+            // any of it yet: a tab has room for one dot. A report without an
+            // id addresses the one record a surface has, which is the only
+            // record this keeps.
+            .report => |report| self.surfaceMessageWriter(.{
+                .program_status = switch (report.state) {
+                    .clear => .none,
+                    .idle => .idle,
+                    .done => .done,
+                    .working => .working,
+                    .blocked => .blocked,
+                    .@"error" => .failed,
+                },
+            }),
+        }
     }
 };
 
